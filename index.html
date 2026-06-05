@@ -58,7 +58,7 @@
     <h2>连接参数</h2>
     <div class="row">
       <label class="f">Service UUID（留空＝自动选第一个含读写/通知特征的服务）
-        <input id="svc" value="0000fee7-0000-1000-8000-00805f9b34fb" />
+        <input id="svc" value="484d4953-0000-1000-8000-00805f9b34fb" />
       </label>
       <label class="f">分片大小 (字节)
         <input id="frag" value="20" inputmode="numeric" />
@@ -235,13 +235,13 @@ let device=null, server=null, txChar=null, rxChar=null, l1seq=0, wakeLock=null;
 // 候选服务：必须在 requestDevice 时声明，否则连上也访问不到。
 // 包含本设备 (eBadgex) 实测暴露的两个服务 + 常见 UUID。
 const KNOWN_SERVICES = [
-  "0000fee7-0000-1000-8000-00805f9b34fb",   // eBadgex
-  "000001ff-3c17-d293-8e48-14fe2e4da212",   // eBadgex 自定义服务
+  "484d4953-0000-1000-8000-00805f9b34fb",   // eBadgex GATT 主服务 (含 ffd1/ffd2/ffd3) ← 实测
+  "6e400001-b5a3-f393-e0a9-e50e24dcca9e",   // Nordic UART (设备也暴露，备用)
+  "0000fee7-0000-1000-8000-00805f9b34fb",   // 广播里的厂商 UUID
+  "000001ff-3c17-d293-8e48-14fe2e4da212",   // 广播里的自定义 UUID
   "0000ffd0-0000-1000-8000-00805f9b34fb",
   "0000ffe0-0000-1000-8000-00805f9b34fb",
-  "0000ffe5-0000-1000-8000-00805f9b34fb",
   "0000fff0-0000-1000-8000-00805f9b34fb",
-  "0000180a-0000-1000-8000-00805f9b34fb",   // Device Information
 ];
 
 function fragSize(){ const v = parseInt($("frag").value,10); return (v>=1 && v<=512)?v:20; }
