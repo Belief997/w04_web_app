@@ -60,8 +60,8 @@
       <label class="f">Service UUID（留空＝自动选第一个含读写/通知特征的服务）
         <input id="svc" value="484d4953-0000-1000-8000-00805f9b34fb" />
       </label>
-      <label class="f">分片大小 (字节)
-        <input id="frag" value="20" inputmode="numeric" />
+      <label class="f">分片大小 (字节，写失败就调小)
+        <input id="frag" value="180" inputmode="numeric" />
       </label>
       <label class="f">TX 写特征（留空＝自动探测可写特征）
         <input id="tx" placeholder="自动" />
@@ -89,6 +89,26 @@
       <input id="hex" placeholder="例如  0b 00 0c 00 00   (示意)" />
     </label>
     <div class="hint">发送方向：手机 → 设备 (写 FFD1)。收到的非 ACK 帧会自动回 L1 ACK。</div>
+  </div>
+
+  <div class="card">
+    <h2>文件下发 (RAW)</h2>
+    <input id="file" type="file" style="font-size:12px;" />
+    <div id="fileInfo" class="hint" style="margin-top:8px;">未选择文件</div>
+    <div class="grid2" style="margin-top:10px;">
+      <button id="btnStart" disabled>开始下发</button>
+      <button id="btnCancel" class="ghost" disabled>取消</button>
+    </div>
+    <div style="height:6px;background:var(--panel2);border-radius:4px;margin-top:12px;overflow:hidden;">
+      <div id="bar" style="height:100%;width:0;background:var(--accent);transition:width .12s;"></div>
+    </div>
+    <div class="row" style="margin-top:8px;font-size:11px;color:var(--muted);font-family:var(--mono);">
+      <span id="stBytes">0 / 0 B</span>
+      <span id="stBlk">块 —</span>
+      <span id="stSpeed">—</span>
+      <span id="stState">空闲</span>
+    </div>
+    <div class="hint">流程：BEGIN_REQ(type=RAW) → 分块 DATA(停等) → END_REQ(CRC32) → END_RSP。块大小由设备 BEGIN_RSP 协商。</div>
   </div>
 
   <div class="card">
@@ -147,6 +167,33 @@ function buildL2(key, value){
 }
 function buildConnReq(){ return new Uint8Array([CMD_CONN,0x00,0x01,0x00,0x00]); }
 
+// ── L2 文件传输子命令 (对照 protocols/l2_file_transfer.py) ──
+const K_BEGIN_REQ=0x01, K_DATA=0x03, K_END_REQ=0x05, K_ABORT=0x07;
+const TYPE_RAW=0x00;
+const u32be = v => [(v>>>24)&0xFF,(v>>>16)&0xFF,(v>>>8)&0xFF,v&0xFF];
+const u16beA = v => [(v>>8)&0xFF, v&0xFF];
+
+// CRC32: zlib/IEEE (反射 poly 0xEDB88320)，等价 Python binascii.crc32
+function crc32(bytes){
+  let crc = 0xFFFFFFFF;
+  for (let i=0;i<bytes.length;i++){
+    crc ^= bytes[i];
+    for (let k=0;k<8;k++) crc = (crc>>>1) ^ (0xEDB88320 & -(crc & 1));
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function buildBeginReq(type, total, chunk, name){
+  const nb = new TextEncoder().encode(name).slice(0,255);
+  const value = new Uint8Array([type, ...u32be(total>>>0), ...u16beA(chunk), nb.length, ...nb]);
+  return buildL2(K_BEGIN_REQ, value);
+}
+function buildDataFrame(blockSeq, chunk){
+  return buildL2(K_DATA, new Uint8Array([...u16beA(blockSeq), ...chunk]));
+}
+function buildEndReq(crc){ return buildL2(K_END_REQ, new Uint8Array(u32be(crc>>>0))); }
+function buildAbort(reason){ return buildL2(K_ABORT, new Uint8Array([reason])); }
+
 // ───────────────────────── 日志 ─────────────────────────
 function log(cls, msg){
   const el = document.createElement("div");
@@ -185,13 +232,16 @@ function handleL1(pkt){
   log("rx", `← L1 raw [${pkt.length}B] ${hex(pkt)}`);
   if (isAck){
     log("ack", `← L1 ACK seq=${seq} ${isErr?"ERR":"OK"}`);
+    xfer.onL1Ack(seq, !isErr);
     return;
   }
   // 数据帧 → 自动回 L1 ACK，再解析 L2
   sendRaw(buildL1Ack(seq), true).then(()=>log("ack", `→ L1 ACK seq=${seq} OK (自动)`)).catch(()=>{});
   const n = u16be(pkt[2], pkt[3]);
   if (n === 0) return;
-  parseL2(pkt.slice(8));
+  const l2 = pkt.slice(8);
+  parseL2(l2);
+  xfer.onL2(l2);
 }
 
 function parseL2(l2){
@@ -256,7 +306,16 @@ function propStr(p){
   return f.join(",")||"-";
 }
 
-async function sendRaw(frame, silent=false){
+// 串行化所有 GATT 写：Web Bluetooth 不允许并发写（否则
+// "GATT operation already in progress"）。自动回 ACK 与状态机发帧可能同时触发。
+let _writeLock = Promise.resolve();
+function sendRaw(frame, silent=false){
+  const run = () => _writeFrame(frame, silent);
+  const p = _writeLock.then(run, run);   // 不论上一笔成败都继续，保持顺序
+  _writeLock = p.catch(()=>{});          // 链上吞掉错误，仅用于排队
+  return p;                              // 调用方拿到真实的成功/失败
+}
+async function _writeFrame(frame, silent){
   if (!txChar) throw new Error("未连接");
   const fs = fragSize();
   for (let i=0;i<frame.length;i+=fs){
@@ -267,10 +326,13 @@ async function sendRaw(frame, silent=false){
   if (!silent) log("tx", `→ L1 raw [${frame.length}B] seq=${u16be(frame[6],frame[7])} ${hex(frame)}`);
 }
 
+function nextSeq(){ const s = l1seq; l1seq = (l1seq + 1) & 0xFFFF; return s; }
+
+// 发送一个 L2 帧，返回所用的 L1 seq（供停等匹配 ACK）
 async function sendL2(payload){
-  const frame = buildL1(payload, l1seq);
-  l1seq = (l1seq + 1) & 0xFFFF;
-  await sendRaw(frame);
+  const seq = nextSeq();
+  await sendRaw(buildL1(payload, seq));
+  return seq;
 }
 
 function setState(txt, kind){
@@ -348,8 +410,9 @@ function onNotify(ev){
 function onDisconnected(){
   setState("已断开","err");
   log("warn","⚠ 设备已断开");
-  toggleButtons(false);
   txChar = rxChar = server = null;
+  xfer.onDisconnect();
+  toggleButtons(false);
   releaseWake();
 }
 
@@ -362,12 +425,174 @@ function toggleButtons(connected){
   $("btnDisconnect").disabled = !connected;
   $("btnConnParams").disabled = !connected;
   $("btnSendHex").disabled = !connected;
+  xfer.refreshStart();
 }
 
 async function requestWake(){
   try{ if ("wakeLock" in navigator){ wakeLock = await navigator.wakeLock.request("screen"); } }catch(_){}
 }
 function releaseWake(){ try{ wakeLock && wakeLock.release(); }catch(_){} wakeLock=null; }
+
+// ───────────────────────── 文件下发状态机 (复刻 tabs/image.py) ─────────────────────────
+const xfer = {
+  S_IDLE:0, S_NEG:1, S_TX:2, S_VER:3,
+  MAX_RETRY:3, T_L1:10000, T_NEG:5000, T_VER:8000,
+  state:0, data:null, name:"", crc:0, chunk:2048, blk:0, retry:0,
+  pending:-1, l1t:0, l2t:0, t0:0,
+
+  setFile(file){
+    const r = new FileReader();
+    r.onload = () => {
+      this.data = new Uint8Array(r.result);
+      this.name = file.name;
+      this.crc  = crc32(this.data);
+      $("fileInfo").textContent =
+        `${file.name} · ${this.data.length.toLocaleString()} B · CRC32=0x${this.crc.toString(16).padStart(8,"0")}`;
+      this.refreshStart();
+    };
+    r.onerror = () => log("err","读取文件失败");
+    r.readAsArrayBuffer(file);
+  },
+
+  refreshStart(){ $("btnStart").disabled = !(this.state===this.S_IDLE && this.data && txChar); },
+
+  start(){
+    if (!this.data){ log("warn","请先选择文件"); return; }
+    if (!txChar){ log("warn","请先连接设备"); return; }
+    this.state=this.S_NEG; this.blk=0; this.retry=0; this.chunk=2048; this.t0=performance.now();
+    this.setStat(0); $("stState").textContent="握手中";
+    $("btnStart").disabled=true; $("btnCancel").disabled=false; $("file").disabled=true;
+    log("info", `▶ 开始下发 RAW: ${this.name} (${this.data.length} B) CRC32=0x${this.crc.toString(16).padStart(8,"0")}`);
+    this.sendBegin();
+  },
+
+  // 预占 L1 seq → 设 pending → 启 L1 看门狗 → 再写出（顺序确保不漏 ACK）
+  async _send(l2){
+    const seq = nextSeq();
+    this.pending = seq;
+    this._armL1();
+    await sendRaw(buildL1(l2, seq));
+  },
+
+  async sendBegin(){
+    try{
+      log("tx", `→ BEGIN_REQ type=RAW size=${this.data.length} chunk=${this.chunk} name="${this.name}"`);
+      await this._send(buildBeginReq(TYPE_RAW, this.data.length, this.chunk, this.name));
+    }catch(e){ this.finish(false,"GATT 写失败: "+(e.message||e)); }
+  },
+
+  async sendChunk(){
+    const off = this.blk*this.chunk;
+    const part = this.data.subarray(off, off+this.chunk);
+    this.setStat(Math.min(off+part.length, this.data.length));
+    $("stBlk").textContent = `块 ${this.blk}`;
+    try{ await this._send(buildDataFrame(this.blk, part)); }
+    catch(e){ this.finish(false,"GATT 写失败: "+(e.message||e)); }
+  },
+
+  async sendEnd(){
+    try{
+      $("stState").textContent="校验中";
+      log("tx", `→ END_REQ crc32=0x${this.crc.toString(16).padStart(8,"0")}`);
+      await this._send(buildEndReq(this.crc));
+    }catch(e){ this.finish(false,"GATT 写失败: "+(e.message||e)); }
+  },
+
+  async abort(reason){
+    if (this.state===this.S_IDLE) return;
+    try{ await sendL2(buildAbort(reason)); }catch(_){}
+    log("warn", `→ ABORT reason=${reason}`);
+    this.finish(false, ({0:"用户取消",1:"传输错误",2:"超时"})[reason] || ("reason="+reason));
+  },
+
+  onL1Ack(seq, ok){
+    if (this.state===this.S_IDLE || this.pending===-1 || seq!==this.pending) return;
+    clearTimeout(this.l1t); this.pending=-1;
+    if (!ok) return this._retryOrAbort("L1 NACK");
+    if (this.state===this.S_NEG){ this._armL2(this.T_NEG); }
+    else if (this.state===this.S_TX){
+      this.retry=0; this.blk++;
+      if (this.blk*this.chunk >= this.data.length){ this.state=this.S_VER; this.sendEnd(); }
+      else this.sendChunk();
+    }
+    else if (this.state===this.S_VER){ this._armL2(this.T_VER); }
+  },
+
+  onL2(l2){
+    if (l2.length<5 || l2[0]!==CMD_FILE) return;
+    const key=l2[2], vlen=u16be(l2[3],l2[4]), value=l2.slice(5,5+vlen);
+    if (key===0x07) this.finish(false, `设备 ABORT reason=0x${(value[0]??0).toString(16)}`);
+    else if (key===0x02) this._onBeginRsp(value);
+    else if (key===0x06) this._onEndRsp(value);
+  },
+
+  _onBeginRsp(value){
+    if (this.state!==this.S_NEG) return;
+    clearTimeout(this.l2t);
+    if (!value.length) return this.finish(false,"BEGIN_RSP 为空");
+    if (value[0]!==0x00) return this.finish(false, "握手拒绝: "+(BEGIN_STATUS[value[0]]??("0x"+value[0].toString(16))));
+    if (value.length>=3){ this.chunk=u16be(value[1],value[2]); log("info",`← 协商块大小=${this.chunk} B`); }
+    this.state=this.S_TX; this.blk=0; this.retry=0;
+    log("info", `开始传输: ${this.data.length} B, ${Math.ceil(this.data.length/this.chunk)} 块 × ${this.chunk} B`);
+    $("stState").textContent="传输中";
+    this.sendChunk();
+  },
+
+  _onEndRsp(value){
+    if (this.state!==this.S_VER) return;
+    clearTimeout(this.l2t);
+    if (!value.length) return this.finish(false,"END_RSP 为空");
+    if (value[0]!==0x00){
+      const ec=value.length>1?value[1]:0;
+      return this.finish(false, (END_STATUS[value[0]]??("status=0x"+value[0].toString(16)))+" / "+(END_ERR[ec]??("ec=0x"+ec.toString(16))));
+    }
+    this.finish(true);
+  },
+
+  _armL1(){ clearTimeout(this.l1t); this.l1t=setTimeout(()=>this._retryOrAbort("L1 ACK 超时"), this.T_L1); },
+  _armL2(ms){ clearTimeout(this.l2t); this.l2t=setTimeout(()=>this._retryOrAbort("L2 响应超时"), ms); },
+
+  _retryOrAbort(why){
+    clearTimeout(this.l1t); clearTimeout(this.l2t); this.pending=-1;
+    this.retry++;
+    if (this.retry>this.MAX_RETRY){ log("err",`${why}，已达最大重试，中止`); return this.abort(0x02); }
+    log("warn", `${why}，重试 ${this.retry}/${this.MAX_RETRY}…`);
+    if (this.state===this.S_NEG) this.sendBegin();
+    else if (this.state===this.S_TX) this.sendChunk();
+    else if (this.state===this.S_VER) this.sendEnd();
+  },
+
+  finish(success, msg){
+    clearTimeout(this.l1t); clearTimeout(this.l2t); this.pending=-1;
+    this.state=this.S_IDLE;
+    if (success){
+      const sec=(performance.now()-this.t0)/1000, spd=this.data.length/1024/(sec||1);
+      $("bar").style.width="100%"; this.setStat(this.data.length);
+      $("stState").textContent="完成"; $("stSpeed").textContent=`${spd.toFixed(1)} KB/s`;
+      log("ack", `✅ 下发成功，用时 ${sec.toFixed(1)}s，均速 ${spd.toFixed(1)} KB/s`);
+    } else {
+      $("stState").textContent="失败"; log("err", `❌ 下发失败: ${msg}`);
+    }
+    $("btnCancel").disabled=true; $("file").disabled=false; this.refreshStart();
+  },
+
+  setStat(sent){
+    const total=this.data?this.data.length:0;
+    $("bar").style.width = total ? (sent*100/total).toFixed(1)+"%" : "0";
+    $("stBytes").textContent = `${sent.toLocaleString()} / ${total.toLocaleString()} B`;
+    const sec=(performance.now()-this.t0)/1000;
+    if (sec>0.2 && sent>0) $("stSpeed").textContent = `${(sent/1024/sec).toFixed(1)} KB/s`;
+  },
+
+  onDisconnect(){
+    if (this.state!==this.S_IDLE){
+      clearTimeout(this.l1t); clearTimeout(this.l2t); this.pending=-1; this.state=this.S_IDLE;
+      $("stState").textContent="断开"; $("btnCancel").disabled=true; $("file").disabled=false;
+      log("err","❌ 传输中断：设备断开");
+    }
+    this.refreshStart();
+  },
+};
 
 // ───────────────────────── 事件绑定 ─────────────────────────
 $("btnConnect").onclick = connect;
@@ -380,6 +605,9 @@ $("btnSendHex").onclick = async () => {
   try{ await sendL2(bytes); }catch(e){ log("err",e.message); }
 };
 $("wake").onchange = e => e.target.checked ? requestWake() : releaseWake();
+$("file").onchange = e => { const f = e.target.files[0]; if (f) xfer.setFile(f); };
+$("btnStart").onclick = () => xfer.start();
+$("btnCancel").onclick = () => xfer.abort(0x00);
 
 // 支持性检测
 (function(){
