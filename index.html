@@ -57,17 +57,17 @@
   <div class="card">
     <h2>连接参数</h2>
     <div class="row">
-      <label class="f">Service UUID
-        <input id="svc" value="0000ffd0-0000-1000-8000-00805f9b34fb" />
+      <label class="f">Service UUID（留空＝自动选第一个含读写/通知特征的服务）
+        <input id="svc" value="0000fee7-0000-1000-8000-00805f9b34fb" />
       </label>
       <label class="f">分片大小 (字节)
         <input id="frag" value="20" inputmode="numeric" />
       </label>
-      <label class="f">TX 写特征 (FFD1)
-        <input id="tx" value="0000ffd1-0000-1000-8000-00805f9b34fb" />
+      <label class="f">TX 写特征（留空＝自动探测可写特征）
+        <input id="tx" placeholder="自动" />
       </label>
-      <label class="f">RX 通知特征 (FFD2)
-        <input id="rx" value="0000ffd2-0000-1000-8000-00805f9b34fb" />
+      <label class="f">RX 通知特征（留空＝自动探测可通知特征）
+        <input id="rx" placeholder="自动" />
       </label>
     </div>
     <div class="row" style="margin-top:10px;">
@@ -76,7 +76,7 @@
       <span class="pill"><span id="dot" class="dot"></span><span id="state">未连接</span></span>
       <label class="pill" style="cursor:pointer;"><input id="wake" type="checkbox" style="width:auto" /> 屏幕常亮</label>
     </div>
-    <div class="hint">连接需点击触发（浏览器要求用户手势）。设备开放特征、无需配对。</div>
+    <div class="hint">连接需点击触发（浏览器要求用户手势）。连上后会枚举全部 GATT 服务/特征并自动识别 TX(可写)/RX(可通知)，日志里能看到完整列表。</div>
   </div>
 
   <div class="card">
@@ -232,7 +232,29 @@ function parseL2(l2){
 // ───────────────────────── BLE ─────────────────────────
 let device=null, server=null, txChar=null, rxChar=null, l1seq=0, wakeLock=null;
 
+// 候选服务：必须在 requestDevice 时声明，否则连上也访问不到。
+// 包含本设备 (eBadgex) 实测暴露的两个服务 + 常见 UUID。
+const KNOWN_SERVICES = [
+  "0000fee7-0000-1000-8000-00805f9b34fb",   // eBadgex
+  "000001ff-3c17-d293-8e48-14fe2e4da212",   // eBadgex 自定义服务
+  "0000ffd0-0000-1000-8000-00805f9b34fb",
+  "0000ffe0-0000-1000-8000-00805f9b34fb",
+  "0000ffe5-0000-1000-8000-00805f9b34fb",
+  "0000fff0-0000-1000-8000-00805f9b34fb",
+  "0000180a-0000-1000-8000-00805f9b34fb",   // Device Information
+];
+
 function fragSize(){ const v = parseInt($("frag").value,10); return (v>=1 && v<=512)?v:20; }
+
+function propStr(p){
+  const f=[];
+  if (p.read) f.push("read");
+  if (p.write) f.push("write");
+  if (p.writeWithoutResponse) f.push("writeNR");
+  if (p.notify) f.push("notify");
+  if (p.indicate) f.push("indicate");
+  return f.join(",")||"-";
+}
 
 async function sendRaw(frame, silent=false){
   if (!txChar) throw new Error("未连接");
@@ -258,17 +280,52 @@ function setState(txt, kind){
 
 async function connect(){
   if (!navigator.bluetooth){ log("err","此浏览器不支持 Web Bluetooth"); return; }
-  const svc = $("svc").value.trim().toLowerCase();
+  const wantSvc = $("svc").value.trim().toLowerCase();
+  const wantTx  = $("tx").value.trim().toLowerCase();
+  const wantRx  = $("rx").value.trim().toLowerCase();
+  // 声明所有候选服务（含用户填写的），否则连上后无法枚举/访问
+  const optional = Array.from(new Set([...KNOWN_SERVICES, wantSvc].filter(Boolean)));
   try{
     setState("选择设备…","");
-    device = await navigator.bluetooth.requestDevice({ acceptAllDevices:true, optionalServices:[svc] });
+    device = await navigator.bluetooth.requestDevice({ acceptAllDevices:true, optionalServices:optional });
     device.addEventListener("gattserverdisconnected", onDisconnected);
     log("info", `选中: ${device.name||"(无名)"}  id=${device.id}`);
     setState("连接中…","");
     server = await device.gatt.connect();
-    const service = await server.getPrimaryService(svc);
-    txChar = await service.getCharacteristic($("tx").value.trim().toLowerCase());
-    rxChar = await service.getCharacteristic($("rx").value.trim().toLowerCase());
+
+    // ── 枚举全部服务/特征 ──
+    const services = await server.getPrimaryServices();
+    log("info", `发现 ${services.length} 个服务（仅含已声明的 optionalServices）：`);
+    const all = [];   // {svc, char, props}
+    for (const s of services){
+      let chars = [];
+      try{ chars = await s.getCharacteristics(); }catch(e){ log("warn",`  服务 ${s.uuid} 取特征失败: ${e.message}`); }
+      log("info", `  服务 ${s.uuid}  (${chars.length} 特征)`);
+      for (const c of chars){
+        log("info", `    特征 ${c.uuid}  [${propStr(c.properties)}]`);
+        all.push({ svc:s, char:c, props:c.properties });
+      }
+    }
+    if (!all.length){ throw new Error("未枚举到任何特征（设备可能未广播这些服务，或需在 optionalServices 中补充 UUID）"); }
+
+    const FFD1 = "0000ffd1-0000-1000-8000-00805f9b34fb";  // Python 端 TX
+    const FFD2 = "0000ffd2-0000-1000-8000-00805f9b34fb";  // Python 端 RX
+    // ── 选 TX：用户指定 > FFD1 > 任一可写特征 ──
+    let tx = wantTx ? all.find(x=>x.char.uuid===wantTx) : null;
+    if (!tx) tx = all.find(x=>x.char.uuid===FFD1 && (x.props.write||x.props.writeWithoutResponse));
+    if (!tx) tx = all.find(x=>x.props.writeWithoutResponse) || all.find(x=>x.props.write);
+    // ── 选 RX：用户指定 > FFD2 > 任一可通知特征 ──
+    let rx = wantRx ? all.find(x=>x.char.uuid===wantRx) : null;
+    if (!rx) rx = all.find(x=>x.char.uuid===FFD2 && (x.props.notify||x.props.indicate));
+    if (!rx) rx = all.find(x=>x.props.notify) || all.find(x=>x.props.indicate);
+    if (!tx) throw new Error("未找到可写特征(TX)");
+    if (!rx) throw new Error("未找到可通知特征(RX)");
+    txChar = tx.char; rxChar = rx.char;
+    $("tx").value = txChar.uuid; $("rx").value = rxChar.uuid;
+    $("svc").value = rxChar.service.uuid;
+    log("ack", `→ 选定 TX=${txChar.uuid} [${propStr(tx.props)}]`);
+    log("ack", `→ 选定 RX=${rxChar.uuid} [${propStr(rx.props)}]`);
+
     await rxChar.startNotifications();
     rxChar.addEventListener("characteristicvaluechanged", onNotify);
     rxBuf = new Uint8Array(0); l1seq = 0;
