@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<meta name="theme-color" content="#0f1115" />
+<link rel="manifest" href="./manifest.json" />
+<title>W04 BLE 下发验证</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1f242d; --border:#2a313c;
+    --text:#e6e9ef; --muted:#8b94a3; --accent:#4c8dff; --ok:#37c871;
+    --warn:#f2b03c; --err:#ff5d5d; --mono:Consolas,"SF Mono",Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--text);font:14px/1.5 system-ui,"PingFang SC","Microsoft YaHei",sans-serif;}
+  .wrap{max-width:760px;margin:0 auto;padding:14px 14px 40px;}
+  h1{font-size:17px;margin:6px 0 2px;}
+  .sub{color:var(--muted);font-size:12px;margin-bottom:14px;}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:12px;margin-bottom:12px;}
+  .card h2{font-size:12px;letter-spacing:.5px;color:var(--muted);text-transform:uppercase;margin:0 0 10px;}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
+  label.f{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--muted);flex:1 1 46%;min-width:140px;}
+  input,select{background:var(--panel2);border:1px solid var(--border);color:var(--text);
+    border-radius:8px;padding:8px 10px;font:13px var(--mono);width:100%;}
+  input:focus{outline:none;border-color:var(--accent);}
+  button{background:var(--accent);color:#fff;border:none;border-radius:8px;padding:9px 14px;
+    font-size:13px;font-weight:600;cursor:pointer;}
+  button.ghost{background:transparent;border:1px solid var(--border);color:var(--text);}
+  button:disabled{opacity:.4;cursor:not-allowed;}
+  .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:4px 10px;border-radius:999px;
+    background:var(--panel2);border:1px solid var(--border);color:var(--muted);}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--muted);}
+  .dot.on{background:var(--ok);box-shadow:0 0 6px var(--ok);}
+  .dot.err{background:var(--err);}
+  #log{background:#0b0d11;border:1px solid var(--border);border-radius:8px;padding:8px 10px;height:300px;
+    overflow:auto;font:12px/1.45 var(--mono);white-space:pre-wrap;word-break:break-all;}
+  .l{margin:0 0 2px;}
+  .l .t{color:#5a6473;}
+  .tx{color:#ffce6b;} .rx{color:#7ad0ff;} .ack{color:#37c871;} .info{color:var(--muted);}
+  .warn{color:var(--warn);} .err{color:var(--err);}
+  .hint{color:var(--muted);font-size:11px;margin-top:6px;}
+  .banner{background:#3a1c1c;border:1px solid #6b2d2d;color:#ffb4b4;padding:10px 12px;border-radius:8px;
+    font-size:13px;margin-bottom:12px;display:none;}
+  .grid2{display:flex;gap:8px;flex-wrap:wrap;}
+  .grid2 button{flex:1 1 auto;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>W04 · 蓝牙下发协议验证</h1>
+  <div class="sub">Web Bluetooth 探针：连接 → 订阅 → 收发原始帧，按 L1/L2 协议解析（仅安卓 Chrome/Edge，需 HTTPS）。</div>
+
+  <div id="unsupported" class="banner"></div>
+
+  <div class="card">
+    <h2>连接参数</h2>
+    <div class="row">
+      <label class="f">Service UUID
+        <input id="svc" value="0000ffd0-0000-1000-8000-00805f9b34fb" />
+      </label>
+      <label class="f">分片大小 (字节)
+        <input id="frag" value="20" inputmode="numeric" />
+      </label>
+      <label class="f">TX 写特征 (FFD1)
+        <input id="tx" value="0000ffd1-0000-1000-8000-00805f9b34fb" />
+      </label>
+      <label class="f">RX 通知特征 (FFD2)
+        <input id="rx" value="0000ffd2-0000-1000-8000-00805f9b34fb" />
+      </label>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <button id="btnConnect">连接设备</button>
+      <button id="btnDisconnect" class="ghost" disabled>断开</button>
+      <span class="pill"><span id="dot" class="dot"></span><span id="state">未连接</span></span>
+      <label class="pill" style="cursor:pointer;"><input id="wake" type="checkbox" style="width:auto" /> 屏幕常亮</label>
+    </div>
+    <div class="hint">连接需点击触发（浏览器要求用户手势）。设备开放特征、无需配对。</div>
+  </div>
+
+  <div class="card">
+    <h2>发送测试帧</h2>
+    <div class="grid2">
+      <button id="btnConnParams" class="ghost" disabled>① 连接参数请求 (0x0C)</button>
+      <button id="btnSendHex" class="ghost" disabled>② 发送自定义 L2</button>
+    </div>
+    <label class="f" style="margin-top:10px;flex:1 1 100%;">自定义 L2 帧 (hex，会自动加 L1 帧头/CRC16/seq 并按分片大小写出)
+      <input id="hex" placeholder="例如  0b 00 0c 00 00   (示意)" />
+    </label>
+    <div class="hint">发送方向：手机 → 设备 (写 FFD1)。收到的非 ACK 帧会自动回 L1 ACK。</div>
+  </div>
+
+  <div class="card">
+    <h2>报文日志 <button id="btnClear" class="ghost" style="float:right;padding:3px 10px;font-size:11px;">清空</button></h2>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+// ───────────────────────── 协议常量 (对照 PROTOCOL.md) ─────────────────────────
+const SOF = 0xAB;
+const CMD_FILE = 0x0B, CMD_CONN = 0x0C;
+const L2_KEYS = {0x01:"BEGIN_REQ",0x02:"BEGIN_RSP",0x03:"DATA",0x05:"END_REQ",0x06:"END_RSP",0x07:"ABORT"};
+const CONN_KEYS = {0x01:"CONN_REQ",0x02:"CONN_RSP"};
+const BEGIN_STATUS = {0:"OK",1:"设备忙",2:"存储不足",3:"类型不支持"};
+const END_STATUS   = {0:"OK",1:"CRC32失败",2:"数据不完整"};
+const END_ERR      = {1:"写入失败",2:"解码失败"};
+
+// ───────────────────────── 工具 ─────────────────────────
+const $ = id => document.getElementById(id);
+const hex = arr => Array.from(arr, b => b.toString(16).padStart(2,"0")).join(" ");
+const u16be = (a,b) => (a<<8)|b;
+function parseHex(str){
+  const t = str.replace(/0x/gi," ").replace(/[^0-9a-fA-F]/g," ").trim().split(/\s+/).filter(Boolean);
+  return new Uint8Array(t.map(x => parseInt(x.length===1?x:x.slice(0,2),16)));
+}
+
+// CRC16: 反射 CCITT, poly 0x8408, init 0 (与 l1_engine.crc16 一致)
+function crc16(bytes){
+  let crc = 0;
+  for (const b of bytes){
+    crc ^= b;
+    for (let i=0;i<8;i++) crc = (crc & 1) ? ((crc>>1)^0x8408) : (crc>>1);
+  }
+  return crc & 0xFFFF;
+}
+
+// L1 数据帧: AB 00 lenHi lenLo crcHi crcLo seqHi seqLo + payload
+function buildL1(payload, seq){
+  const n = payload.length;
+  const head = [SOF,0x00,(n>>8)&0xFF,n&0xFF];
+  const c = crc16(new Uint8Array([...head, ...payload]));
+  return new Uint8Array([SOF,0x00,(n>>8)&0xFF,n&0xFF,(c>>8)&0xFF,c&0xFF,(seq>>8)&0xFF,seq&0xFF, ...payload]);
+}
+// L1 ACK 帧 (8B, 无 payload). flag: 0x10=OK / 0x30=ERR
+function buildL1Ack(seq, err=false){
+  const b1 = err?0x30:0x10;
+  const h = [SOF,b1,0x00,0x00];
+  const c = crc16(new Uint8Array(h));
+  return new Uint8Array([SOF,b1,0x00,0x00,(c>>8)&0xFF,c&0xFF,(seq>>8)&0xFF,seq&0xFF]);
+}
+// L2 帧: 0B 00 key vlenHi vlenLo + value
+function buildL2(key, value){
+  return new Uint8Array([CMD_FILE,0x00,key,(value.length>>8)&0xFF,value.length&0xFF, ...value]);
+}
+function buildConnReq(){ return new Uint8Array([CMD_CONN,0x00,0x01,0x00,0x00]); }
+
+// ───────────────────────── 日志 ─────────────────────────
+function log(cls, msg){
+  const el = document.createElement("div");
+  el.className = "l";
+  const t = new Date().toLocaleTimeString("en-GB");
+  el.innerHTML = `<span class="t">${t}</span> <span class="${cls}">${msg}</span>`;
+  const box = $("log");
+  box.appendChild(el);
+  while (box.childElementCount > 800) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+}
+
+// ───────────────────────── 解析收到的 L1 流 ─────────────────────────
+let rxBuf = new Uint8Array(0);
+function concat(a,b){ const o=new Uint8Array(a.length+b.length); o.set(a); o.set(b,a.length); return o; }
+
+function drainRx(){
+  let off = 0;
+  while (true){
+    while (off < rxBuf.length && rxBuf[off] !== SOF) off++;
+    const remain = rxBuf.length - off;
+    if (remain < 8) break;
+    const n = u16be(rxBuf[off+2], rxBuf[off+3]);
+    if (remain < 8 + n) break;
+    const pkt = rxBuf.slice(off, off+8+n);
+    off += 8 + n;
+    handleL1(pkt);
+  }
+  rxBuf = off>0 ? rxBuf.slice(off) : rxBuf;
+}
+
+function handleL1(pkt){
+  const b1 = pkt[1];
+  const seq = u16be(pkt[6], pkt[7]);
+  const isAck = !!(b1 & 0x10), isErr = !!(b1 & 0x20);
+  log("rx", `← L1 raw [${pkt.length}B] ${hex(pkt)}`);
+  if (isAck){
+    log("ack", `← L1 ACK seq=${seq} ${isErr?"ERR":"OK"}`);
+    return;
+  }
+  // 数据帧 → 自动回 L1 ACK，再解析 L2
+  sendRaw(buildL1Ack(seq), true).then(()=>log("ack", `→ L1 ACK seq=${seq} OK (自动)`)).catch(()=>{});
+  const n = u16be(pkt[2], pkt[3]);
+  if (n === 0) return;
+  parseL2(pkt.slice(8));
+}
+
+function parseL2(l2){
+  if (l2.length < 5){ log("warn", `  L2 过短: ${hex(l2)}`); return; }
+  const cmd = l2[0], key = l2[2], vlen = u16be(l2[3], l2[4]);
+  const value = l2.slice(5, 5+vlen);
+  if (cmd === CMD_FILE){
+    const name = L2_KEYS[key] || `0x${key.toString(16)}`;
+    let extra = "";
+    if (key === 0x02){ // BEGIN_RSP
+      const st = value[0];
+      extra = ` status=${BEGIN_STATUS[st]??("0x"+st.toString(16))}`;
+      if (value.length>=3) extra += ` 协商块=${u16be(value[1],value[2])}B`;
+    } else if (key === 0x06){ // END_RSP
+      const st = value[0];
+      extra = ` status=${END_STATUS[st]??("0x"+st.toString(16))}`;
+      if (value.length>1) extra += ` err=${END_ERR[value[1]]??("0x"+value[1].toString(16))}`;
+    } else if (key === 0x07){ // ABORT
+      extra = ` reason=0x${(value[0]??0).toString(16)}`;
+    }
+    log("rx", `  └ L2 FILE/${name} vlen=${vlen}${extra}  value=${hex(value)}`);
+  } else if (cmd === CMD_CONN){
+    const name = CONN_KEYS[key] || `0x${key.toString(16)}`;
+    let extra = "";
+    if (key === 0x02 && value.length>=7){ // CONN_RSP: >HHHB
+      const interval = u16be(value[0],value[1])*1.25;
+      const latency  = u16be(value[2],value[3]);
+      const timeout  = u16be(value[4],value[5])*10;
+      const mtu      = value[6];
+      extra = ` interval=${interval}ms latency=${latency} timeout=${timeout}ms mtu=${mtu}`;
+    }
+    log("rx", `  └ L2 CONN/${name} vlen=${vlen}${extra}  value=${hex(value)}`);
+  } else {
+    log("rx", `  └ L2 cmd=0x${cmd.toString(16)} key=0x${key.toString(16)} value=${hex(value)}`);
+  }
+}
+
+// ───────────────────────── BLE ─────────────────────────
+let device=null, server=null, txChar=null, rxChar=null, l1seq=0, wakeLock=null;
+
+function fragSize(){ const v = parseInt($("frag").value,10); return (v>=1 && v<=512)?v:20; }
+
+async function sendRaw(frame, silent=false){
+  if (!txChar) throw new Error("未连接");
+  const fs = fragSize();
+  for (let i=0;i<frame.length;i+=fs){
+    const part = frame.slice(i, i+fs);
+    if (txChar.writeValueWithoutResponse) await txChar.writeValueWithoutResponse(part);
+    else await txChar.writeValue(part);
+  }
+  if (!silent) log("tx", `→ L1 raw [${frame.length}B] seq=${u16be(frame[6],frame[7])} ${hex(frame)}`);
+}
+
+async function sendL2(payload){
+  const frame = buildL1(payload, l1seq);
+  l1seq = (l1seq + 1) & 0xFFFF;
+  await sendRaw(frame);
+}
+
+function setState(txt, kind){
+  $("state").textContent = txt;
+  const d = $("dot"); d.className = "dot" + (kind==="on"?" on":kind==="err"?" err":"");
+}
+
+async function connect(){
+  if (!navigator.bluetooth){ log("err","此浏览器不支持 Web Bluetooth"); return; }
+  const svc = $("svc").value.trim().toLowerCase();
+  try{
+    setState("选择设备…","");
+    device = await navigator.bluetooth.requestDevice({ acceptAllDevices:true, optionalServices:[svc] });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+    log("info", `选中: ${device.name||"(无名)"}  id=${device.id}`);
+    setState("连接中…","");
+    server = await device.gatt.connect();
+    const service = await server.getPrimaryService(svc);
+    txChar = await service.getCharacteristic($("tx").value.trim().toLowerCase());
+    rxChar = await service.getCharacteristic($("rx").value.trim().toLowerCase());
+    await rxChar.startNotifications();
+    rxChar.addEventListener("characteristicvaluechanged", onNotify);
+    rxBuf = new Uint8Array(0); l1seq = 0;
+    setState(`已连接: ${device.name||"设备"}`,"on");
+    log("ack", "✓ 已连接，已订阅 RX 通知");
+    toggleButtons(true);
+    if ($("wake").checked) await requestWake();
+  }catch(e){
+    setState("连接失败","err");
+    log("err", `连接失败: ${e.message||e}`);
+  }
+}
+
+function onNotify(ev){
+  const v = new Uint8Array(ev.target.value.buffer);
+  rxBuf = concat(rxBuf, v);
+  drainRx();
+}
+
+function onDisconnected(){
+  setState("已断开","err");
+  log("warn","⚠ 设备已断开");
+  toggleButtons(false);
+  txChar = rxChar = server = null;
+  releaseWake();
+}
+
+async function disconnect(){
+  try{ if (device && device.gatt.connected) device.gatt.disconnect(); }catch(_){}
+}
+
+function toggleButtons(connected){
+  $("btnConnect").disabled = connected;
+  $("btnDisconnect").disabled = !connected;
+  $("btnConnParams").disabled = !connected;
+  $("btnSendHex").disabled = !connected;
+}
+
+async function requestWake(){
+  try{ if ("wakeLock" in navigator){ wakeLock = await navigator.wakeLock.request("screen"); } }catch(_){}
+}
+function releaseWake(){ try{ wakeLock && wakeLock.release(); }catch(_){} wakeLock=null; }
+
+// ───────────────────────── 事件绑定 ─────────────────────────
+$("btnConnect").onclick = connect;
+$("btnDisconnect").onclick = disconnect;
+$("btnClear").onclick = () => $("log").innerHTML = "";
+$("btnConnParams").onclick = async () => { try{ await sendL2(buildConnReq()); }catch(e){ log("err",e.message);} };
+$("btnSendHex").onclick = async () => {
+  const bytes = parseHex($("hex").value);
+  if (!bytes.length){ log("warn","请输入有效 hex"); return; }
+  try{ await sendL2(bytes); }catch(e){ log("err",e.message); }
+};
+$("wake").onchange = e => e.target.checked ? requestWake() : releaseWake();
+
+// 支持性检测
+(function(){
+  if (!navigator.bluetooth){
+    const b = $("unsupported");
+    b.style.display = "block";
+    b.innerHTML = "⚠ 当前浏览器不支持 Web Bluetooth。请在 <b>安卓 Chrome / Edge</b> 中通过 <b>HTTPS</b> 打开。iOS Safari 不支持。";
+    $("btnConnect").disabled = true;
+  } else if (!window.isSecureContext){
+    const b = $("unsupported");
+    b.style.display = "block";
+    b.innerHTML = "⚠ 非安全上下文。Web Bluetooth 需要 <b>HTTPS</b>（或 localhost）。";
+  }
+})();
+</script>
+</body>
+</html>

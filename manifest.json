@@ -1,0 +1,14 @@
+{
+  "name": "W04 BLE 下发验证",
+  "short_name": "W04 BLE",
+  "description": "Web Bluetooth 探针：连接设备、订阅通知、按 L1/L2 协议解析收发报文。",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f1115",
+  "theme_color": "#0f1115",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
