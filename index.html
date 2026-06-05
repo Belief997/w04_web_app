@@ -94,7 +94,11 @@
   <div class="card">
     <h2>文件下发 (RAW)</h2>
     <input id="file" type="file" style="font-size:12px;" />
-    <div id="fileInfo" class="hint" style="margin-top:8px;">未选择文件</div>
+    <div class="grid2" style="margin-top:8px;">
+      <button id="btnW4" class="ghost" style="font-size:12px;">示例 wallpaper_4</button>
+      <button id="btnW5" class="ghost" style="font-size:12px;">示例 wallpaper_5</button>
+    </div>
+    <div id="fileInfo" class="hint" style="margin-top:8px;">未选择文件（可选本地文件，或点上方示例一键加载）</div>
     <div class="grid2" style="margin-top:10px;">
       <button id="btnStart" disabled>开始下发</button>
       <button id="btnCancel" class="ghost" disabled>取消</button>
@@ -440,18 +444,34 @@ const xfer = {
   state:0, data:null, name:"", crc:0, chunk:2048, blk:0, retry:0,
   pending:-1, l1t:0, l2t:0, t0:0,
 
+  loadBytes(name, bytes){
+    if (this.state!==this.S_IDLE){ log("warn","传输进行中，无法切换文件"); return; }
+    this.data = bytes; this.name = name; this.crc = crc32(bytes);
+    $("fileInfo").textContent =
+      `${name} · ${bytes.length.toLocaleString()} B · CRC32=0x${this.crc.toString(16).padStart(8,"0")}`;
+    log("info", `已载入 ${name} (${bytes.length.toLocaleString()} B)`);
+    this.refreshStart();
+  },
+
   setFile(file){
     const r = new FileReader();
-    r.onload = () => {
-      this.data = new Uint8Array(r.result);
-      this.name = file.name;
-      this.crc  = crc32(this.data);
-      $("fileInfo").textContent =
-        `${file.name} · ${this.data.length.toLocaleString()} B · CRC32=0x${this.crc.toString(16).padStart(8,"0")}`;
-      this.refreshStart();
-    };
+    r.onload  = () => this.loadBytes(file.name, new Uint8Array(r.result));
     r.onerror = () => log("err","读取文件失败");
     r.readAsArrayBuffer(file);
+  },
+
+  async loadSample(url){
+    const name = url.split("/").pop();
+    try{
+      $("fileInfo").textContent = `加载 ${name} …`;
+      const resp = await fetch(url, {cache:"no-store"});
+      if (!resp.ok) throw new Error("HTTP "+resp.status);
+      const buf = await resp.arrayBuffer();
+      this.loadBytes(name, new Uint8Array(buf));
+    }catch(e){
+      $("fileInfo").textContent = "未选择文件";
+      log("err", `加载示例 ${name} 失败: ${e.message||e}`);
+    }
   },
 
   refreshStart(){ $("btnStart").disabled = !(this.state===this.S_IDLE && this.data && txChar); },
@@ -606,6 +626,8 @@ $("btnSendHex").onclick = async () => {
 };
 $("wake").onchange = e => e.target.checked ? requestWake() : releaseWake();
 $("file").onchange = e => { const f = e.target.files[0]; if (f) xfer.setFile(f); };
+$("btnW4").onclick = () => xfer.loadSample("./tests/wallpaper_4.bin");
+$("btnW5").onclick = () => xfer.loadSample("./tests/wallpaper_5.bin");
 $("btnStart").onclick = () => xfer.start();
 $("btnCancel").onclick = () => xfer.abort(0x00);
 
