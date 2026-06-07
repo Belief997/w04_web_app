@@ -45,13 +45,32 @@
     font-size:13px;margin-bottom:12px;display:none;}
   .grid2{display:flex;gap:8px;flex-wrap:wrap;}
   .grid2 button{flex:1 1 auto;}
+  .tabs{display:flex;gap:6px;margin-bottom:14px;}
+  .tabs button{flex:1;background:var(--panel2);border:1px solid var(--border);color:var(--muted);
+    border-radius:10px;padding:11px;font-weight:600;}
+  .tabs button.active{background:var(--accent);color:#fff;border-color:var(--accent);}
+  .tabpanel[hidden]{display:none;}
+  video,.cv{width:100%;background:#000;border-radius:8px;border:1px solid var(--border);display:block;}
+  .cv{image-rendering:pixelated;}
+  .radio{display:flex;gap:8px;}
+  .radio label{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;background:var(--panel2);
+    border:1px solid var(--border);border-radius:8px;padding:9px;cursor:pointer;font-size:13px;color:var(--text);}
+  .radio input{width:auto;}
+  .stat{display:flex;gap:6px 14px;flex-wrap:wrap;font:12px var(--mono);color:var(--muted);margin-top:10px;}
+  .stat b{color:var(--text);font-weight:600;}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>W04 · 蓝牙下发协议验证</h1>
-  <div class="sub">Web Bluetooth 探针：连接 → 订阅 → 收发原始帧，按 L1/L2 协议解析（仅安卓 Chrome/Edge，需 HTTPS）。</div>
+  <h1>W04 · 调试工具</h1>
+  <div class="sub">蓝牙下发协议验证 · 摄像头视频编码 (MSV1 / JPEG)。仅安卓 Chrome/Edge，需 HTTPS。</div>
 
+  <div class="tabs">
+    <button id="tabBle" class="active">蓝牙下发</button>
+    <button id="tabEnc">视频编码</button>
+  </div>
+
+  <div id="tab-ble" class="tabpanel">
   <div id="unsupported" class="banner"></div>
 
   <div class="card">
@@ -119,6 +138,86 @@
     <h2>报文日志 <button id="btnClear" class="ghost" style="float:right;padding:3px 10px;font-size:11px;">清空</button></h2>
     <div id="log"></div>
   </div>
+  </div><!-- /tab-ble -->
+
+  <div id="tab-enc" class="tabpanel" hidden>
+    <div id="encWarn" class="banner"></div>
+
+    <div class="card">
+      <h2>摄像头</h2>
+      <div class="row">
+        <label class="f">镜头
+          <select id="encFacing">
+            <option value="environment">后置</option>
+            <option value="user">前置</option>
+          </select>
+        </label>
+        <label class="f">操作
+          <div class="grid2">
+            <button id="encCamStart">启动摄像头</button>
+            <button id="encCamStop" class="ghost" disabled>关闭</button>
+          </div>
+        </label>
+      </div>
+      <video id="encVideo" autoplay muted playsinline style="margin-top:10px;"></video>
+      <div id="encSrcInfo" class="hint">未启动。getUserMedia 需 HTTPS 与用户授权（点击“启动摄像头”触发）。</div>
+    </div>
+
+    <div class="card" id="encCfgCard">
+      <h2>编码设置（开始后锁定）</h2>
+      <div class="radio" style="margin-bottom:10px;">
+        <label><input type="radio" name="encCodec" value="msv1" checked> MSV1 · 16bpp RGB555</label>
+        <label><input type="radio" name="encCodec" value="jpeg"> JPEG · MJPEG</label>
+      </div>
+      <div class="row">
+        <label class="f">输出宽 (MSV1 对齐 4)
+          <input id="encW" value="160" inputmode="numeric" /></label>
+        <label class="f">输出高 (MSV1 对齐 4)
+          <input id="encH" value="120" inputmode="numeric" /></label>
+        <label class="f">帧率 fps
+          <input id="encFps" value="10" inputmode="numeric" /></label>
+        <label class="f">JPEG 质量 1-100
+          <input id="encQ" value="70" inputmode="numeric" /></label>
+      </div>
+      <div class="row" style="margin-top:6px;">
+        <label class="f">裁剪 X (源像素，留空=整帧)
+          <input id="encCx" placeholder="自动" inputmode="numeric" /></label>
+        <label class="f">裁剪 Y
+          <input id="encCy" placeholder="自动" inputmode="numeric" /></label>
+        <label class="f">裁剪宽
+          <input id="encCw" placeholder="自动" inputmode="numeric" /></label>
+        <label class="f">裁剪高
+          <input id="encCh" placeholder="自动" inputmode="numeric" /></label>
+      </div>
+      <div class="hint">裁剪先在源帧上取矩形，再缩放到输出分辨率。编码方式与所有参数在“开始编码”后锁定，需停止才能修改。</div>
+    </div>
+
+    <div class="card">
+      <h2>编码与预览（往返解码）</h2>
+      <div class="grid2">
+        <button id="encStart" disabled>开始编码</button>
+        <button id="encStop" class="ghost" disabled>停止</button>
+        <button id="encDownload" class="ghost" disabled>下载 .avi</button>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer;user-select:none;">
+        <input type="checkbox" id="encPreviewOn" checked style="width:18px;height:18px;flex:0 0 auto;" />
+        <span>实时预览（关闭可省电、降低手机负载；不影响编码与下载）</span>
+      </label>
+      <canvas id="encPreview" class="cv" style="margin-top:10px;"></canvas>
+      <div class="stat">
+        <span>编码 <b id="esCodec">—</b></span>
+        <span>输出 <b id="esRes">—</b></span>
+        <span>实测 <b id="esFps">0</b> fps</span>
+        <span>帧数 <b id="esFrames">0</b></span>
+        <span>本帧 <b id="esLast">0</b></span>
+        <span>均帧 <b id="esAvg">0</b></span>
+        <span>累计 <b id="esTotal">0</b></span>
+        <span>码率 <b id="esRate">0</b></span>
+      </div>
+      <div id="encMsg" class="hint"></div>
+      <div class="hint">预览为“编码后再解码”的真实画面（MSV1 在浏览器内解码往返，JPEG 重解码显示）。停止后可下载 .avi，在 PC 用 VLC / ffmpeg 验证。</div>
+    </div>
+  </div><!-- /tab-enc -->
 </div>
 
 <script>
@@ -630,6 +729,298 @@ $("btnW4").onclick = () => xfer.loadSample("./tests/wallpaper_4.bin");
 $("btnW5").onclick = () => xfer.loadSample("./tests/wallpaper_5.bin");
 $("btnStart").onclick = () => xfer.start();
 $("btnCancel").onclick = () => xfer.abort(0x00);
+
+// ════════════════════════ Tab 2 · 视频编码 (MSV1 / JPEG) ════════════════════════
+// MSV1 编码器/解码器 + AVI 封装：移植自 _msv1_probe，已用 ffmpeg 逐字节校验。
+// 严格对照 libavcodec/msvideo1.c 解码器：块自底向上；2-color 掩码 bit0=左下像素、
+// 行内左→右、行自下而上、bit15=右上像素，且掩码 bit15 必须为 0（否则被当作单色块，
+// 故 bit15 置位时整体取反并交换两色，解码等价）；单色块高字节落在 0x84..0x87 会被当作
+// skip 跳块，故此类颜色 (c555 在 0x0400..0x07FF) 改用退化的 2-color 块表示。
+function rgb555(r,g,b){ return (((r>>3)&31)<<10)|(((g>>3)&31)<<5)|((b>>3)&31); }
+const MSV1_SCAN = [12,13,14,15,8,9,10,11,4,5,6,7,0,1,2,3];
+const isSkipColorMsv1 = w => ((w>>8)&0xfc)===0x84;
+
+function encodeMSV1Frame(rgba, W, H){
+  const bw=W>>2, bh=H>>2, words=[];
+  for (let by=bh-1; by>=0; by--) for (let bx=0; bx<bw; bx++) encMsv1Block(rgba,W,bx*4,by*4,words);
+  words.push(0x0000);
+  const out=new Uint8Array(words.length*2);
+  for (let i=0;i<words.length;i++){ out[i*2]=words[i]&0xff; out[i*2+1]=(words[i]>>8)&0xff; }
+  return out;
+}
+function pushSolidMsv1(words,c555){
+  const w=(c555&0x7fff)|0x8000;
+  if (isSkipColorMsv1(w)) words.push(0x0000,0x0000,c555&0x7fff); else words.push(w);
+}
+function encMsv1Block(rgba,W,x0,y0,words){
+  const r=new Array(16),g=new Array(16),b=new Array(16),c=new Array(16);
+  for (let py=0;py<4;py++) for (let px=0;px<4;px++){
+    const idx=((y0+py)*W+(x0+px))*4, k=py*4+px;
+    r[k]=rgba[idx]; g[k]=rgba[idx+1]; b[k]=rgba[idx+2]; c[k]=rgb555(r[k],g[k],b[k]);
+  }
+  let solid=true; for (let k=1;k<16;k++) if (c[k]!==c[0]){ solid=false; break; }
+  if (solid){ pushSolidMsv1(words,c[0]); return; }
+  let lo=1e9,hi=-1,loi=0,hii=0;
+  for (let k=0;k<16;k++){ const L=r[k]*299+g[k]*587+b[k]*114; if(L<lo){lo=L;loi=k;} if(L>hi){hi=L;hii=k;} }
+  const sa=[r[hii],g[hii],b[hii]], sb=[r[loi],g[loi],b[loi]], grp=new Array(16);
+  let aR=0,aG=0,aB=0,na=0,bR=0,bG=0,bB=0,nb=0;
+  for (let k=0;k<16;k++){
+    const da=(r[k]-sa[0])**2+(g[k]-sa[1])**2+(b[k]-sa[2])**2;
+    const db=(r[k]-sb[0])**2+(g[k]-sb[1])**2+(b[k]-sb[2])**2;
+    if (da<=db){ grp[k]=1; aR+=r[k];aG+=g[k];aB+=b[k];na++; } else { grp[k]=0; bR+=r[k];bG+=g[k];bB+=b[k];nb++; }
+  }
+  if (na===0||nb===0){ pushSolidMsv1(words,c[0]); return; }
+  let cA=rgb555(aR/na|0,aG/na|0,aB/na|0), cB=rgb555(bR/nb|0,bG/nb|0,bB/nb|0);
+  let mask=0; for (let i=0;i<16;i++) if (grp[MSV1_SCAN[i]]===1) mask|=1<<i;
+  if (mask&0x8000){ mask^=0xffff; const t=cA; cA=cB; cB=t; }
+  words.push(mask&0xffff, cA&0x7fff, cB&0x7fff);
+}
+
+function decodeMSV1Frame(buf, W, H){
+  const out=new Uint8ClampedArray(W*H*4); const bw=W>>2, bh=H>>2; let sp=0;
+  const rd=()=>{ const v=buf[sp]|(buf[sp+1]<<8); sp+=2; return v; };
+  const put=(x,y,c)=>{ const r=(c>>10)&31,g=(c>>5)&31,b=c&31,i=(y*W+x)*4;
+    out[i]=(r<<3)|(r>>2); out[i+1]=(g<<3)|(g>>2); out[i+2]=(b<<3)|(b>>2); out[i+3]=255; };
+  let total=bw*bh, skip=0;
+  for (let by=bh-1; by>=0; by--) for (let bx=0; bx<bw; bx++){
+    const x0=bx*4, y0=by*4;
+    if (skip>0){ skip--; total--; continue; }
+    const a=buf[sp], bb=buf[sp+1];
+    if (a===0&&bb===0&&total===0) return out;
+    if ((bb&0xfc)===0x84){ sp+=2; skip=((bb-0x84)<<8)+a-1; total--; continue; }
+    if (bb<0x80){
+      const flags=rd(), c0=rd(), c1=rd();
+      if (c0&0x8000){
+        const cols=[c0,c1,rd(),rd(),rd(),rd(),rd(),rd()]; let f=flags;
+        for (let py=0;py<4;py++) for (let px=0;px<4;px++,f>>=1)
+          put(x0+px, y0+(3-py), cols[((py&2)<<1)+(px&2)+((f&1)^1)]);
+      } else { let f=flags;
+        for (let py=0;py<4;py++) for (let px=0;px<4;px++,f>>=1)
+          put(x0+px, y0+(3-py), (f&1)? c0 : c1);
+      }
+    } else { const c=((bb<<8)|a)&0x7fff; sp+=2; for (let py=0;py<4;py++) for (let px=0;px<4;px++) put(x0+px,y0+py,c); }
+    total--;
+  }
+  return out;
+}
+
+// 最小 AVI 封装（vids：MSVC 16bpp / MJPG 24bpp 通用）
+class AviW{ constructor(){ this.b=[]; }
+  str(s){ for(let i=0;i<s.length;i++) this.b.push(s.charCodeAt(i)&255); return this; }
+  u16(v){ this.b.push(v&255,(v>>8)&255); return this; }
+  u32(v){ this.b.push(v&255,(v>>8)&255,(v>>16)&255,(v>>>24)&255); return this; }
+  bytes(a){ for(let i=0;i<a.length;i++) this.b.push(a[i]&255); return this; }
+  out(){ return Uint8Array.from(this.b); }
+}
+function buildAVI(frames, width, height, fps, fourcc, bitCount){
+  const n=frames.length; let maxF=1;
+  const chunks=frames.map(f=>{ const pad=f.length&1; if(f.length>maxF) maxF=f.length; return {f,pad,total:8+f.length+pad}; });
+  let cur=4; const idx=chunks.map(c=>{ const off=cur; cur+=c.total; return {off,size:c.f.length}; });
+  const moviData=cur, idx1Data=16*n, hdrlData=4+64+124;
+  const riffData=4+(8+hdrlData)+(8+moviData)+(8+idx1Data);
+  const usPerFrame=Math.round(1e6/fps), w=new AviW();
+  w.str("RIFF").u32(riffData).str("AVI ");
+  w.str("LIST").u32(hdrlData).str("hdrl");
+  w.str("avih").u32(56).u32(usPerFrame).u32(0).u32(0).u32(0x10).u32(n).u32(0).u32(1).u32(maxF)
+    .u32(width).u32(height).u32(0).u32(0).u32(0).u32(0);
+  w.str("LIST").u32(124).str("strl");
+  w.str("strh").u32(56).str("vids").str(fourcc).u32(0).u16(0).u16(0).u32(0)
+    .u32(1).u32(fps).u32(0).u32(n).u32(maxF).u32(0xffffffff).u32(0).u16(0).u16(0).u16(width).u16(height);
+  w.str("strf").u32(40).u32(40).u32(width).u32(height).u16(1).u16(bitCount)
+    .str(fourcc).u32(width*height*2).u32(0).u32(0).u32(0).u32(0);
+  w.str("LIST").u32(moviData).str("movi");
+  for (const c of chunks){ w.str("00dc").u32(c.f.length).bytes(c.f); if(c.pad) w.b.push(0); }
+  w.str("idx1").u32(idx1Data);
+  for (const e of idx) w.str("00dc").u32(0x10).u32(e.off).u32(e.size);
+  return w.out();
+}
+
+function fmtBytes(n){ if(n<1024) return n+" B"; if(n<1048576) return (n/1024).toFixed(1)+" KB"; return (n/1048576).toFixed(2)+" MB"; }
+function fmtRate(bps){ if(bps<1000) return bps.toFixed(0)+" bps"; if(bps<1e6) return (bps/1000).toFixed(1)+" kbps"; return (bps/1e6).toFixed(2)+" Mbps"; }
+
+const enc = {
+  stream:null, running:false, timer:0, codec:"msv1",
+  outW:160, outH:120, fps:10, quality:70, crop:null, previewOn:true,
+  frames:[], totalBytes:0, fpsTimes:[], lastTickStart:0,
+  CAP_FRAMES:1800, CAP_BYTES:64*1024*1024,
+  work:null, wctx:null, pctx:null,
+
+  init(){
+    this.work=document.createElement("canvas");
+    this.wctx=this.work.getContext("2d",{willReadFrequently:true});
+    this.pctx=$("encPreview").getContext("2d");
+    $("tabBle").onclick=()=>showTab("ble");
+    $("tabEnc").onclick=()=>showTab("enc");
+    $("encCamStart").onclick=()=>this.startCam();
+    $("encCamStop").onclick=()=>this.stopCam();
+    $("encStart").onclick=()=>this.start();
+    $("encStop").onclick=()=>this.stop();
+    $("encDownload").onclick=()=>this.download();
+    $("encPreviewOn").onchange=()=>this.setPreview($("encPreviewOn").checked);
+  },
+
+  msg(t,cls){ const e=$("encMsg"); e.textContent=t||""; e.style.color = cls==="err"?"var(--err)":cls==="ok"?"var(--ok)":"var(--muted)"; },
+
+  setPreview(on){ this.previewOn=on; if(!on) this.drawPreviewOff(); },
+  drawPreviewOff(){
+    const cv=$("encPreview"), g=this.pctx; if(!g||!cv.width||!cv.height) return;
+    g.clearRect(0,0,cv.width,cv.height);
+    g.fillStyle="#8a93a3"; g.textAlign="center"; g.textBaseline="middle";
+    g.font=Math.max(10,Math.floor(cv.width/12))+"px system-ui,sans-serif";
+    g.fillText("预览已关闭 · 节省资源", cv.width/2, cv.height/2);
+  },
+
+  async startCam(){
+    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)){ this.msg("此浏览器不支持 getUserMedia","err"); return; }
+    this.stopCam();
+    try{
+      const facing=$("encFacing").value;
+      this.stream=await navigator.mediaDevices.getUserMedia({ video:{ facingMode:facing, width:{ideal:1280}, height:{ideal:720} }, audio:false });
+      const v=$("encVideo"); v.srcObject=this.stream; await v.play().catch(()=>{});
+      if (!v.videoWidth) await new Promise(res=>{ v.onloadedmetadata=()=>res(); });
+      $("encSrcInfo").textContent=`源分辨率 ${v.videoWidth}×${v.videoHeight} · 镜头=${facing==="environment"?"后置":"前置"}`;
+      $("encCamStart").disabled=true; $("encCamStop").disabled=false; $("encStart").disabled=false;
+      this.msg("摄像头已启动，可开始编码","ok");
+    }catch(e){ this.msg("启动摄像头失败: "+(e.message||e),"err"); }
+  },
+
+  stopCam(){
+    if (this.running) this.stop();
+    if (this.stream){ this.stream.getTracks().forEach(t=>t.stop()); this.stream=null; }
+    $("encVideo").srcObject=null;
+    $("encCamStart").disabled=false; $("encCamStop").disabled=true; $("encStart").disabled=true;
+  },
+
+  lockCfg(lock){
+    ["encW","encH","encFps","encQ","encCx","encCy","encCw","encCh","encFacing","encCamStart"].forEach(id=>$(id).disabled=lock);
+    document.querySelectorAll('input[name=encCodec]').forEach(r=>r.disabled=lock);
+  },
+
+  readCrop(v){
+    const g=id=>{ const t=$(id).value.trim(); return t===""?null:Math.max(0,parseInt(t,10)||0); };
+    let x=g("encCx"),y=g("encCy"),w=g("encCw"),h=g("encCh");
+    if (x===null||y===null||w===null||h===null||w<=0||h<=0) return {x:0,y:0,w:v.videoWidth,h:v.videoHeight};
+    x=Math.min(x,v.videoWidth-1); y=Math.min(y,v.videoHeight-1);
+    w=Math.min(w,v.videoWidth-x); h=Math.min(h,v.videoHeight-y);
+    return {x,y,w,h};
+  },
+
+  start(){
+    if (this.running || !this.stream) return;
+    const v=$("encVideo");
+    this.codec=document.querySelector('input[name=encCodec]:checked').value;
+    let w=parseInt($("encW").value,10)||160, h=parseInt($("encH").value,10)||120;
+    w=Math.max(4,Math.min(1920,w)); h=Math.max(4,Math.min(1080,h));
+    if (this.codec==="msv1"){ w&=~3; h&=~3; if(w<4)w=4; if(h<4)h=4; }
+    this.outW=w; this.outH=h;
+    this.fps=Math.max(1,Math.min(60,parseInt($("encFps").value,10)||10));
+    this.quality=Math.max(1,Math.min(100,parseInt($("encQ").value,10)||70));
+    this.crop=this.readCrop(v);
+    this.work.width=w; this.work.height=h;
+    const pv=$("encPreview"); pv.width=w; pv.height=h;
+    if (!this.previewOn) this.drawPreviewOff();
+    this.frames=[]; this.totalBytes=0; this.fpsTimes=[];
+    this.running=true; this.lockCfg(true);
+    $("encStart").disabled=true; $("encStop").disabled=false; $("encDownload").disabled=true;
+    $("esCodec").textContent = this.codec==="msv1"?"MSV1":"JPEG";
+    $("esRes").textContent = `${w}×${h}`;
+    this.msg(`编码中… ${this.codec==="msv1"?"MSV1 16bpp":"JPEG q"+this.quality} ${w}×${h} @${this.fps}fps · 裁剪 ${this.crop.w}×${this.crop.h}`);
+    this.lastTickStart=performance.now()-1000/this.fps;
+    this.tick();
+  },
+
+  async tick(){
+    if (!this.running) return;
+    this.lastTickStart=performance.now();
+    const v=$("encVideo"), c=this.crop;
+    try{ this.wctx.drawImage(v, c.x,c.y,c.w,c.h, 0,0,this.outW,this.outH); }catch(_){}
+    let bytes=0;
+    if (this.codec==="msv1"){
+      const img=this.wctx.getImageData(0,0,this.outW,this.outH);
+      const frame=encodeMSV1Frame(img.data, this.outW, this.outH);
+      this.frames.push(frame); bytes=frame.length;
+      if (this.previewOn){
+        const dec=decodeMSV1Frame(frame, this.outW, this.outH);
+        this.pctx.putImageData(new ImageData(dec, this.outW, this.outH), 0, 0);
+      }
+    } else {
+      const blob=await new Promise(r=>this.work.toBlob(r,"image/jpeg",this.quality/100));
+      if (!this.running || !blob) return;
+      const buf=new Uint8Array(await blob.arrayBuffer());
+      this.frames.push(buf); bytes=buf.length;
+      if (this.previewOn){
+        try{ const bmp=await createImageBitmap(blob); this.pctx.drawImage(bmp,0,0,this.outW,this.outH); bmp.close&&bmp.close(); }catch(_){}
+      }
+    }
+    this.totalBytes+=bytes;
+    this.updateStats(bytes);
+    if (this.frames.length>=this.CAP_FRAMES || this.totalBytes>=this.CAP_BYTES){
+      this.msg(`达到缓存上限（${this.frames.length} 帧 / ${fmtBytes(this.totalBytes)}），已自动停止`,"ok"); this.stop(); return;
+    }
+    this.scheduleNext();
+  },
+
+  scheduleNext(){
+    if (!this.running) return;
+    const interval=1000/this.fps, elapsed=performance.now()-this.lastTickStart;
+    this.timer=setTimeout(()=>this.tick(), Math.max(0, interval-elapsed));
+  },
+
+  updateStats(lastBytes){
+    const now=performance.now(); this.fpsTimes.push(now);
+    while (this.fpsTimes.length>2 && now-this.fpsTimes[0]>2000) this.fpsTimes.shift();
+    let fps=0; if (this.fpsTimes.length>1) fps=(this.fpsTimes.length-1)*1000/(now-this.fpsTimes[0]);
+    const nF=this.frames.length, avg=nF?this.totalBytes/nF:0;
+    $("esFps").textContent=fps.toFixed(1);
+    $("esFrames").textContent=nF;
+    $("esLast").textContent=fmtBytes(lastBytes);
+    $("esAvg").textContent=fmtBytes(Math.round(avg));
+    $("esTotal").textContent=fmtBytes(this.totalBytes);
+    $("esRate").textContent=fmtRate(avg*fps*8);
+  },
+
+  stop(){
+    if (!this.running) return;
+    this.running=false; clearTimeout(this.timer);
+    this.lockCfg(false);
+    $("encStart").disabled=!this.stream; $("encStop").disabled=true;
+    $("encDownload").disabled=this.frames.length===0;
+    this.msg(`已停止：${this.frames.length} 帧，合计 ${fmtBytes(this.totalBytes)}（可下载 .avi 在 PC 验证）`,"ok");
+  },
+
+  download(){
+    if (!this.frames.length) return;
+    const isMsv1=this.codec==="msv1";
+    const avi=buildAVI(this.frames, this.outW, this.outH, this.fps, isMsv1?"MSVC":"MJPG", isMsv1?16:24);
+    const url=URL.createObjectURL(new Blob([avi], {type:"video/avi"}));
+    const a=document.createElement("a");
+    const ts=new Date().toISOString().replace(/[-:T]/g,"").slice(0,14);
+    a.href=url; a.download=`enc_${isMsv1?"msv1":"mjpg"}_${this.outW}x${this.outH}_${ts}.avi`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url), 4000);
+  },
+};
+
+function showTab(which){
+  $("tab-ble").hidden = which!=="ble";
+  $("tab-enc").hidden = which!=="enc";
+  $("tabBle").classList.toggle("active", which==="ble");
+  $("tabEnc").classList.toggle("active", which==="enc");
+}
+
+enc.init();
+
+// 视频编码支持性检测
+(function(){
+  if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)){
+    const b=$("encWarn"); b.style.display="block";
+    b.innerHTML="⚠ 当前环境不支持摄像头采集 (getUserMedia)。需 <b>HTTPS</b> 且浏览器支持。";
+    $("encCamStart").disabled=true;
+  } else if (!window.isSecureContext){
+    const b=$("encWarn"); b.style.display="block";
+    b.innerHTML="⚠ 非安全上下文，摄像头需要 <b>HTTPS</b>（或 localhost）。";
+  }
+})();
 
 // 支持性检测
 (function(){
