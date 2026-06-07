@@ -217,6 +217,28 @@
       <div id="encMsg" class="hint"></div>
       <div class="hint">预览为“编码后再解码”的真实画面（MSV1 在浏览器内解码往返，JPEG 重解码显示）。停止后可下载 .avi，在 PC 用 VLC / ffmpeg 验证。</div>
     </div>
+
+    <div class="card">
+      <h2>实时发送到设备（边编码边下发 BLE）</h2>
+      <div id="encTxWarn" class="hint">①先到「BLE 调试」页连接设备　②再启动摄像头</div>
+      <div class="grid2">
+        <button id="encTxStart" disabled>开始实时发送</button>
+        <button id="encTxStop" class="ghost" disabled>停止</button>
+      </div>
+      <div class="grid2" style="margin-top:8px;">
+        <button id="encTxOne" class="ghost" disabled>调试 · 手动发送单帧</button>
+      </div>
+      <div class="stat">
+        <span>状态 <b id="etState">—</b></span>
+        <span>已发帧 <b id="etFrames">0</b></span>
+        <span>本帧 <b id="etLast">0</b></span>
+        <span>发送 <b id="etFps">0</b> fps</span>
+        <span>累计 <b id="etTotal">0</b></span>
+        <span>码率 <b id="etRate">0</b></span>
+      </div>
+      <div id="encTxMsg" class="hint"></div>
+      <div class="hint">采集→编码一帧→按「文件」下发(type=RAW，纯编码字节)→发完再采下一帧，由 BLE 停等限速、不缓存累积。复用「BLE 调试」页的下发协议与连接，单文件下发流程不受影响。SoC 端按约定的输出分辨率（见上方“输出”）解码每帧。</div>
+    </div>
   </div><!-- /tab-enc -->
 </div>
 
@@ -332,18 +354,20 @@ function handleL1(pkt){
   const b1 = pkt[1];
   const seq = u16be(pkt[6], pkt[7]);
   const isAck = !!(b1 & 0x10), isErr = !!(b1 & 0x20);
-  log("rx", `← L1 raw [${pkt.length}B] ${hex(pkt)}`);
+  const quiet = xfer.streaming;   // 流式发送时抑制逐帧 L1/L2 日志，避免刷屏
+  if (!quiet) log("rx", `← L1 raw [${pkt.length}B] ${hex(pkt)}`);
   if (isAck){
-    log("ack", `← L1 ACK seq=${seq} ${isErr?"ERR":"OK"}`);
+    if (!quiet) log("ack", `← L1 ACK seq=${seq} ${isErr?"ERR":"OK"}`);
     xfer.onL1Ack(seq, !isErr);
     return;
   }
   // 数据帧 → 自动回 L1 ACK，再解析 L2
-  sendRaw(buildL1Ack(seq), true).then(()=>log("ack", `→ L1 ACK seq=${seq} OK (自动)`)).catch(()=>{});
+  const ackP = sendRaw(buildL1Ack(seq), true);
+  if (!quiet) ackP.then(()=>log("ack", `→ L1 ACK seq=${seq} OK (自动)`)).catch(()=>{}); else ackP.catch(()=>{});
   const n = u16be(pkt[2], pkt[3]);
   if (n === 0) return;
   const l2 = pkt.slice(8);
-  parseL2(l2);
+  if (!quiet) parseL2(l2);
   xfer.onL2(l2);
 }
 
@@ -515,6 +539,7 @@ function onDisconnected(){
   log("warn","⚠ 设备已断开");
   txChar = rxChar = server = null;
   xfer.onDisconnect();
+  if (typeof enc!=="undefined" && enc.onBleDown) enc.onBleDown();
   toggleButtons(false);
   releaseWake();
 }
@@ -529,6 +554,7 @@ function toggleButtons(connected){
   $("btnConnParams").disabled = !connected;
   $("btnSendHex").disabled = !connected;
   xfer.refreshStart();
+  if (typeof enc!=="undefined" && enc.refreshTx) enc.refreshTx();
 }
 
 async function requestWake(){
@@ -542,14 +568,29 @@ const xfer = {
   MAX_RETRY:3, T_L1:10000, T_NEG:5000, T_VER:8000,
   state:0, data:null, name:"", crc:0, chunk:2048, blk:0, retry:0,
   pending:-1, l1t:0, l2t:0, t0:0,
+  streaming:false, _done:null,   // 流式发送：抑制逐帧日志 + 完成回调
 
-  loadBytes(name, bytes){
-    if (this.state!==this.S_IDLE){ log("warn","传输进行中，无法切换文件"); return; }
+  loadBytes(name, bytes, quiet){
+    if (this.state!==this.S_IDLE){ if(!quiet) log("warn","传输进行中，无法切换文件"); return; }
     this.data = bytes; this.name = name; this.crc = crc32(bytes);
-    $("fileInfo").textContent =
-      `${name} · ${bytes.length.toLocaleString()} B · CRC32=0x${this.crc.toString(16).padStart(8,"0")}`;
-    log("info", `已载入 ${name} (${bytes.length.toLocaleString()} B)`);
-    this.refreshStart();
+    if (!quiet){
+      $("fileInfo").textContent =
+        `${name} · ${bytes.length.toLocaleString()} B · CRC32=0x${this.crc.toString(16).padStart(8,"0")}`;
+      log("info", `已载入 ${name} (${bytes.length.toLocaleString()} B)`);
+      this.refreshStart();
+    }
+  },
+
+  // 流式：把一段字节当作一个文件发送，完成(成功/失败)后 resolve(bool)。
+  // 复用整套 BEGIN/DATA/END 状态机；verbose=true 时保留完整 L1/L2 日志与 BLE 页 UI（调试单帧用），
+  // 否则(连续流)抑制逐帧日志与 UI 抖动以免刷屏。
+  sendBytes(name, bytes, verbose){
+    return new Promise((resolve)=>{
+      if (this.state!==this.S_IDLE || !txChar){ resolve(false); return; }
+      this.streaming = !verbose; this._done = resolve;
+      this.loadBytes(name, bytes, !verbose);
+      this.start();
+    });
   },
 
   setFile(file){
@@ -581,7 +622,7 @@ const xfer = {
     this.state=this.S_NEG; this.blk=0; this.retry=0; this.chunk=2048; this.t0=performance.now();
     this.setStat(0); $("stState").textContent="握手中";
     $("btnStart").disabled=true; $("btnCancel").disabled=false; $("file").disabled=true;
-    log("info", `▶ 开始下发 RAW: ${this.name} (${this.data.length} B) CRC32=0x${this.crc.toString(16).padStart(8,"0")}`);
+    if (!this.streaming) log("info", `▶ 开始下发 RAW: ${this.name} (${this.data.length} B) CRC32=0x${this.crc.toString(16).padStart(8,"0")}`);
     this.sendBegin();
   },
 
@@ -595,7 +636,7 @@ const xfer = {
 
   async sendBegin(){
     try{
-      log("tx", `→ BEGIN_REQ type=RAW size=${this.data.length} chunk=${this.chunk} name="${this.name}"`);
+      if (!this.streaming) log("tx", `→ BEGIN_REQ type=RAW size=${this.data.length} chunk=${this.chunk} name="${this.name}"`);
       await this._send(buildBeginReq(TYPE_RAW, this.data.length, this.chunk, this.name));
     }catch(e){ this.finish(false,"GATT 写失败: "+(e.message||e)); }
   },
@@ -612,7 +653,7 @@ const xfer = {
   async sendEnd(){
     try{
       $("stState").textContent="校验中";
-      log("tx", `→ END_REQ crc32=0x${this.crc.toString(16).padStart(8,"0")}`);
+      if (!this.streaming) log("tx", `→ END_REQ crc32=0x${this.crc.toString(16).padStart(8,"0")}`);
       await this._send(buildEndReq(this.crc));
     }catch(e){ this.finish(false,"GATT 写失败: "+(e.message||e)); }
   },
@@ -650,9 +691,9 @@ const xfer = {
     clearTimeout(this.l2t);
     if (!value.length) return this.finish(false,"BEGIN_RSP 为空");
     if (value[0]!==0x00) return this.finish(false, "握手拒绝: "+(BEGIN_STATUS[value[0]]??("0x"+value[0].toString(16))));
-    if (value.length>=3){ this.chunk=u16be(value[1],value[2]); log("info",`← 协商块大小=${this.chunk} B`); }
+    if (value.length>=3){ this.chunk=u16be(value[1],value[2]); if(!this.streaming) log("info",`← 协商块大小=${this.chunk} B`); }
     this.state=this.S_TX; this.blk=0; this.retry=0;
-    log("info", `开始传输: ${this.data.length} B, ${Math.ceil(this.data.length/this.chunk)} 块 × ${this.chunk} B`);
+    if (!this.streaming) log("info", `开始传输: ${this.data.length} B, ${Math.ceil(this.data.length/this.chunk)} 块 × ${this.chunk} B`);
     $("stState").textContent="传输中";
     this.sendChunk();
   },
@@ -684,15 +725,18 @@ const xfer = {
   finish(success, msg){
     clearTimeout(this.l1t); clearTimeout(this.l2t); this.pending=-1;
     this.state=this.S_IDLE;
-    if (success){
-      const sec=(performance.now()-this.t0)/1000, spd=this.data.length/1024/(sec||1);
-      $("bar").style.width="100%"; this.setStat(this.data.length);
-      $("stState").textContent="完成"; $("stSpeed").textContent=`${spd.toFixed(1)} KB/s`;
-      log("ack", `✅ 下发成功，用时 ${sec.toFixed(1)}s，均速 ${spd.toFixed(1)} KB/s`);
-    } else {
-      $("stState").textContent="失败"; log("err", `❌ 下发失败: ${msg}`);
+    if (!this.streaming){
+      if (success){
+        const sec=(performance.now()-this.t0)/1000, spd=this.data.length/1024/(sec||1);
+        $("bar").style.width="100%"; this.setStat(this.data.length);
+        $("stState").textContent="完成"; $("stSpeed").textContent=`${spd.toFixed(1)} KB/s`;
+        log("ack", `✅ 下发成功，用时 ${sec.toFixed(1)}s，均速 ${spd.toFixed(1)} KB/s`);
+      } else {
+        $("stState").textContent="失败"; log("err", `❌ 下发失败: ${msg}`);
+      }
+      $("btnCancel").disabled=true; $("file").disabled=false; this.refreshStart();
     }
-    $("btnCancel").disabled=true; $("file").disabled=false; this.refreshStart();
+    if (this._done){ const d=this._done; this._done=null; d(success); }   // 流式：唤醒下一帧
   },
 
   setStat(sent){
@@ -706,9 +750,9 @@ const xfer = {
   onDisconnect(){
     if (this.state!==this.S_IDLE){
       clearTimeout(this.l1t); clearTimeout(this.l2t); this.pending=-1; this.state=this.S_IDLE;
-      $("stState").textContent="断开"; $("btnCancel").disabled=true; $("file").disabled=false;
-      log("err","❌ 传输中断：设备断开");
+      if (!this.streaming){ $("stState").textContent="断开"; $("btnCancel").disabled=true; $("file").disabled=false; log("err","❌ 传输中断：设备断开"); }
     }
+    if (this._done){ const d=this._done; this._done=null; d(false); }   // 流式：解阻塞，循环据此停止
     this.refreshStart();
   },
 };
@@ -841,9 +885,11 @@ function fmtRate(bps){ if(bps<1000) return bps.toFixed(0)+" bps"; if(bps<1e6) re
 const enc = {
   stream:null, running:false, timer:0, codec:"msv1",
   outW:160, outH:120, fps:10, quality:70, crop:null, previewOn:true,
-  frames:[], totalBytes:0, fpsTimes:[], lastTickStart:0,
+  frames:[], totalBytes:0, fpsTimes:[], lastTickStart:0, lastFps:0,
   CAP_FRAMES:1800, CAP_BYTES:64*1024*1024,
   work:null, wctx:null, pctx:null,
+  mode:"record", nFrames:0, streamSeq:0,   // mode: "record"(本地录制+下载) | "stream"(实时 BLE 下发)
+  sending:false, dbgSeq:0,                  // sending=单帧调试发送进行中；dbgSeq=调试帧序号
 
   init(){
     this.work=document.createElement("canvas");
@@ -853,13 +899,76 @@ const enc = {
     $("tabEnc").onclick=()=>showTab("enc");
     $("encCamStart").onclick=()=>this.startCam();
     $("encCamStop").onclick=()=>this.stopCam();
-    $("encStart").onclick=()=>this.start();
+    $("encStart").onclick=()=>this.start("record");
     $("encStop").onclick=()=>this.stop();
     $("encDownload").onclick=()=>this.download();
     $("encPreviewOn").onchange=()=>this.setPreview($("encPreviewOn").checked);
+    $("encTxStart").onclick=()=>this.start("stream");
+    $("encTxStop").onclick=()=>this.stop();
+    $("encTxOne").onclick=()=>this.sendOne();
+    this.refreshTx();
   },
 
   msg(t,cls){ const e=$("encMsg"); e.textContent=t||""; e.style.color = cls==="err"?"var(--err)":cls==="ok"?"var(--ok)":"var(--muted)"; },
+  txMsg(t,cls){ const e=$("encTxMsg"); e.textContent=t||""; e.style.color = cls==="err"?"var(--err)":cls==="ok"?"var(--ok)":"var(--muted)"; },
+
+  // 发送按钮可用性：需已连接(txChar) + 摄像头就绪 + 未在运行 + 未在单帧发送中
+  refreshTx(){
+    const connected = (typeof txChar!=="undefined") && !!txChar;
+    const ready = connected && !!this.stream && !this.running && !this.sending;
+    $("encTxStart").disabled = !ready;
+    $("encTxOne").disabled   = !ready;
+    const w=$("encTxWarn");
+    if (this.running) w.textContent = this.mode==="stream" ? "实时发送中…" : "本地录制中（停止后可实时发送 / 单帧调试）";
+    else if (this.sending) w.textContent="单帧发送中…";
+    else if (!connected) w.textContent="① 先到「BLE 调试」页连接设备";
+    else if (!this.stream) w.textContent="② 再启动摄像头";
+    else w.textContent="就绪：可开始实时发送，或「调试 · 手动发送单帧」";
+  },
+
+  // BLE 断开：若正在实时发送则停止
+  onBleDown(){ if (this.running && this.mode==="stream"){ this.txMsg("设备已断开，实时发送停止","err"); this.stop(); } this.refreshTx(); },
+
+  // 调试：按当前设置采集并编码一帧，单独下发一次（verbose=保留完整 L1/L2 日志便于排查）
+  async sendOne(){
+    if (this.running || this.sending || !this.stream) return;
+    if (!(typeof txChar!=="undefined" && txChar)){ this.txMsg("未连接设备：请先到「BLE 调试」页连接","err"); return; }
+    if (xfer.state!==xfer.S_IDLE){ this.txMsg("BLE 正忙，请稍候再试","err"); return; }
+    this.sending=true; this.refreshTx();
+    const v=$("encVideo");
+    const codec=document.querySelector('input[name=encCodec]:checked').value;
+    let w=parseInt($("encW").value,10)||160, h=parseInt($("encH").value,10)||120;
+    w=Math.max(4,Math.min(1920,w)); h=Math.max(4,Math.min(1080,h));
+    if (codec==="msv1"){ w&=~3; h&=~3; if(w<4)w=4; if(h<4)h=4; }
+    const quality=Math.max(1,Math.min(100,parseInt($("encQ").value,10)||70));
+    const crop=this.readCrop(v);
+    this.work.width=w; this.work.height=h;
+    const pv=$("encPreview"); pv.width=w; pv.height=h;
+    if (!this.previewOn) this.drawPreviewOff();
+    try{ this.wctx.drawImage(v, crop.x,crop.y,crop.w,crop.h, 0,0,w,h); }catch(_){}
+    let frame=null;
+    try{
+      if (codec==="msv1"){
+        const img=this.wctx.getImageData(0,0,w,h);
+        frame=encodeMSV1Frame(img.data, w, h);
+        if (this.previewOn){ const dec=decodeMSV1Frame(frame,w,h); this.pctx.putImageData(new ImageData(dec,w,h),0,0); }
+      } else {
+        const blob=await new Promise(r=>this.work.toBlob(r,"image/jpeg",quality/100));
+        if (blob){ frame=new Uint8Array(await blob.arrayBuffer()); if (this.previewOn){ try{ const bmp=await createImageBitmap(blob); this.pctx.drawImage(bmp,0,0,w,h); bmp.close&&bmp.close(); }catch(_){} } }
+      }
+    }catch(e){ frame=null; }
+    if (!frame || !frame.length){ this.sending=false; this.refreshTx(); this.txMsg("编码失败，未发送","err"); return; }
+    const ext = codec==="msv1" ? "msv1" : "jpg";
+    const name = `debug_${String(this.dbgSeq).padStart(4,"0")}.${ext}`;
+    $("etState").textContent="单帧发送中"; $("etLast").textContent=fmtBytes(frame.length);
+    this.txMsg(`单帧发送中… ${name} · ${fmtBytes(frame.length)} (${w}×${h} ${codec==="msv1"?"MSV1":"JPEG"})`);
+    let ok=false;
+    try{ ok = await xfer.sendBytes(name, frame, true); }catch(_){ ok=false; }   // verbose=true：完整日志
+    this.sending=false;
+    if (ok){ this.dbgSeq++; $("etState").textContent="单帧完成"; this.txMsg(`单帧已发送 ✓ ${name} · ${fmtBytes(frame.length)} (${w}×${h} ${codec==="msv1"?"MSV1":"JPEG"})`,"ok"); }
+    else   { $("etState").textContent="单帧失败"; this.txMsg(`单帧发送失败：${name}（详见 BLE 调试页日志）`,"err"); }
+    this.refreshTx();
+  },
 
   setPreview(on){ this.previewOn=on; if(!on) this.drawPreviewOff(); },
   drawPreviewOff(){
@@ -881,6 +990,7 @@ const enc = {
       $("encSrcInfo").textContent=`源分辨率 ${v.videoWidth}×${v.videoHeight} · 镜头=${facing==="environment"?"后置":"前置"}`;
       $("encCamStart").disabled=true; $("encCamStop").disabled=false; $("encStart").disabled=false;
       this.msg("摄像头已启动，可开始编码","ok");
+      this.refreshTx();
     }catch(e){ this.msg("启动摄像头失败: "+(e.message||e),"err"); }
   },
 
@@ -889,6 +999,7 @@ const enc = {
     if (this.stream){ this.stream.getTracks().forEach(t=>t.stop()); this.stream=null; }
     $("encVideo").srcObject=null;
     $("encCamStart").disabled=false; $("encCamStop").disabled=true; $("encStart").disabled=true;
+    this.refreshTx();
   },
 
   lockCfg(lock){
@@ -905,8 +1016,14 @@ const enc = {
     return {x,y,w,h};
   },
 
-  start(){
+  start(mode){
     if (this.running || !this.stream) return;
+    mode = mode==="stream" ? "stream" : "record";
+    if (mode==="stream"){
+      if (!(typeof txChar!=="undefined" && txChar)){ this.txMsg("未连接设备：请先到「BLE 调试」页连接","err"); return; }
+      if (xfer.state!==xfer.S_IDLE){ this.txMsg("BLE 正忙（单文件下发进行中），请稍候","err"); return; }
+    }
+    this.mode=mode;
     const v=$("encVideo");
     this.codec=document.querySelector('input[name=encCodec]:checked').value;
     let w=parseInt($("encW").value,10)||160, h=parseInt($("encH").value,10)||120;
@@ -919,12 +1036,21 @@ const enc = {
     this.work.width=w; this.work.height=h;
     const pv=$("encPreview"); pv.width=w; pv.height=h;
     if (!this.previewOn) this.drawPreviewOff();
-    this.frames=[]; this.totalBytes=0; this.fpsTimes=[];
+    this.frames=[]; this.totalBytes=0; this.fpsTimes=[]; this.nFrames=0; this.streamSeq=0; this.lastFps=0;
     this.running=true; this.lockCfg(true);
-    $("encStart").disabled=true; $("encStop").disabled=false; $("encDownload").disabled=true;
+    $("encStart").disabled=true; $("encDownload").disabled=true;
     $("esCodec").textContent = this.codec==="msv1"?"MSV1":"JPEG";
     $("esRes").textContent = `${w}×${h}`;
-    this.msg(`编码中… ${this.codec==="msv1"?"MSV1 16bpp":"JPEG q"+this.quality} ${w}×${h} @${this.fps}fps · 裁剪 ${this.crop.w}×${this.crop.h}`);
+    if (mode==="stream"){
+      $("encTxStart").disabled=true; $("encTxStop").disabled=false; $("encStop").disabled=true;
+      $("etState").textContent="发送中"; $("etFrames").textContent="0"; $("etTotal").textContent="0";
+      this.refreshTx();
+      this.txMsg(`实时发送中… ${this.codec==="msv1"?"MSV1 16bpp":"JPEG q"+this.quality} ${w}×${h} · 裁剪 ${this.crop.w}×${this.crop.h}`);
+    } else {
+      $("encStop").disabled=false;
+      this.refreshTx();   // 录制中：禁用 实时发送 + 单帧调试
+      this.msg(`编码中… ${this.codec==="msv1"?"MSV1 16bpp":"JPEG q"+this.quality} ${w}×${h} @${this.fps}fps · 裁剪 ${this.crop.w}×${this.crop.h}`);
+    }
     this.lastTickStart=performance.now()-1000/this.fps;
     this.tick();
   },
@@ -934,11 +1060,10 @@ const enc = {
     this.lastTickStart=performance.now();
     const v=$("encVideo"), c=this.crop;
     try{ this.wctx.drawImage(v, c.x,c.y,c.w,c.h, 0,0,this.outW,this.outH); }catch(_){}
-    let bytes=0;
+    let frame=null;
     if (this.codec==="msv1"){
       const img=this.wctx.getImageData(0,0,this.outW,this.outH);
-      const frame=encodeMSV1Frame(img.data, this.outW, this.outH);
-      this.frames.push(frame); bytes=frame.length;
+      frame=encodeMSV1Frame(img.data, this.outW, this.outH);
       if (this.previewOn){
         const dec=decodeMSV1Frame(frame, this.outW, this.outH);
         this.pctx.putImageData(new ImageData(dec, this.outW, this.outH), 0, 0);
@@ -946,18 +1071,33 @@ const enc = {
     } else {
       const blob=await new Promise(r=>this.work.toBlob(r,"image/jpeg",this.quality/100));
       if (!this.running || !blob) return;
-      const buf=new Uint8Array(await blob.arrayBuffer());
-      this.frames.push(buf); bytes=buf.length;
+      frame=new Uint8Array(await blob.arrayBuffer());
       if (this.previewOn){
         try{ const bmp=await createImageBitmap(blob); this.pctx.drawImage(bmp,0,0,this.outW,this.outH); bmp.close&&bmp.close(); }catch(_){}
       }
     }
-    this.totalBytes+=bytes;
+    const bytes=frame.length;
+    this.nFrames++; this.totalBytes+=bytes;
     this.updateStats(bytes);
-    if (this.frames.length>=this.CAP_FRAMES || this.totalBytes>=this.CAP_BYTES){
-      this.msg(`达到缓存上限（${this.frames.length} 帧 / ${fmtBytes(this.totalBytes)}），已自动停止`,"ok"); this.stop(); return;
+
+    if (this.mode==="stream"){
+      // 一帧 = 一个文件下发；发完再采下一帧，由 BLE 停等限速、不累积缓存
+      const ext = this.codec==="msv1" ? "msv1" : "jpg";
+      const name = `${this.codec}_${String(this.streamSeq).padStart(6,"0")}.${ext}`;
+      let ok=false;
+      try{ ok = await xfer.sendBytes(name, frame); }catch(_){ ok=false; }
+      if (!this.running) return;                       // 发送途中被停止
+      if (!ok){ this.txMsg("发送失败/设备断开，已停止","err"); this.stop(); return; }
+      this.streamSeq++;
+      this.updateTxStats(bytes);
+      this.scheduleNext();                             // fps 仅作上限，实际由 BLE 限速
+    } else {
+      this.frames.push(frame);
+      if (this.frames.length>=this.CAP_FRAMES || this.totalBytes>=this.CAP_BYTES){
+        this.msg(`达到缓存上限（${this.frames.length} 帧 / ${fmtBytes(this.totalBytes)}），已自动停止`,"ok"); this.stop(); return;
+      }
+      this.scheduleNext();
     }
-    this.scheduleNext();
   },
 
   scheduleNext(){
@@ -970,7 +1110,8 @@ const enc = {
     const now=performance.now(); this.fpsTimes.push(now);
     while (this.fpsTimes.length>2 && now-this.fpsTimes[0]>2000) this.fpsTimes.shift();
     let fps=0; if (this.fpsTimes.length>1) fps=(this.fpsTimes.length-1)*1000/(now-this.fpsTimes[0]);
-    const nF=this.frames.length, avg=nF?this.totalBytes/nF:0;
+    this.lastFps=fps;
+    const nF=this.nFrames, avg=nF?this.totalBytes/nF:0;
     $("esFps").textContent=fps.toFixed(1);
     $("esFrames").textContent=nF;
     $("esLast").textContent=fmtBytes(lastBytes);
@@ -979,13 +1120,31 @@ const enc = {
     $("esRate").textContent=fmtRate(avg*fps*8);
   },
 
+  updateTxStats(lastBytes){
+    const nF=this.nFrames, avg=nF?this.totalBytes/nF:0, fps=this.lastFps;
+    $("etFrames").textContent=nF;
+    $("etLast").textContent=fmtBytes(lastBytes);
+    $("etFps").textContent=fps.toFixed(1);
+    $("etTotal").textContent=fmtBytes(this.totalBytes);
+    $("etRate").textContent=fmtRate(avg*fps*8);
+  },
+
   stop(){
     if (!this.running) return;
     this.running=false; clearTimeout(this.timer);
+    const wasStream = this.mode==="stream";
+    if (wasStream && xfer.state!==xfer.S_IDLE){ try{ xfer.abort(0x00); }catch(_){} }
+    xfer.streaming=false;
     this.lockCfg(false);
-    $("encStart").disabled=!this.stream; $("encStop").disabled=true;
+    $("encStart").disabled=!this.stream; $("encStop").disabled=true; $("encTxStop").disabled=true;
     $("encDownload").disabled=this.frames.length===0;
-    this.msg(`已停止：${this.frames.length} 帧，合计 ${fmtBytes(this.totalBytes)}（可下载 .avi 在 PC 验证）`,"ok");
+    if (wasStream){
+      $("etState").textContent="已停止";
+      this.txMsg(`已停止：已发送 ${this.nFrames} 帧，合计 ${fmtBytes(this.totalBytes)}`,"ok");
+    } else {
+      this.msg(`已停止：${this.frames.length} 帧，合计 ${fmtBytes(this.totalBytes)}（可下载 .avi 在 PC 验证）`,"ok");
+    }
+    this.refreshTx();
   },
 
   download(){
