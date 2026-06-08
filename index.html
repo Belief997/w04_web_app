@@ -171,9 +171,9 @@
       </div>
       <div class="row">
         <label class="f">输出宽 (MSV1 对齐 4)
-          <input id="encW" value="160" inputmode="numeric" /></label>
+          <input id="encW" value="360" inputmode="numeric" /></label>
         <label class="f">输出高 (MSV1 对齐 4)
-          <input id="encH" value="120" inputmode="numeric" /></label>
+          <input id="encH" value="360" inputmode="numeric" /></label>
         <label class="f">帧率 fps
           <input id="encFps" value="10" inputmode="numeric" /></label>
         <label class="f">JPEG 质量 1-100
@@ -916,7 +916,7 @@ function fmtRate(bps){ if(bps<1000) return bps.toFixed(0)+" bps"; if(bps<1e6) re
 
 const enc = {
   stream:null, running:false, timer:0, codec:"msv1",
-  outW:160, outH:120, fps:10, quality:70, crop:null, previewOn:true,
+  outW:360, outH:360, fps:10, quality:70, crop:null, previewOn:true,
   frames:[], totalBytes:0, fpsTimes:[], lastTickStart:0, lastFps:0,
   CAP_FRAMES:1800, CAP_BYTES:64*1024*1024,
   work:null, wctx:null, pctx:null,
@@ -972,7 +972,7 @@ const enc = {
     this.sending=true; this.refreshTx();
     const v=$("encVideo");
     const codec=document.querySelector('input[name=encCodec]:checked').value;
-    let w=parseInt($("encW").value,10)||160, h=parseInt($("encH").value,10)||120;
+    let w=parseInt($("encW").value,10)||360, h=parseInt($("encH").value,10)||360;
     w=Math.max(4,Math.min(1920,w)); h=Math.max(4,Math.min(1080,h));
     if (codec==="msv1"){ w&=~3; h&=~3; if(w<4)w=4; if(h<4)h=4; }
     const quality=Math.max(1,Math.min(100,parseInt($("encQ").value,10)||70));
@@ -1061,7 +1061,7 @@ const enc = {
     this.mode=mode;
     const v=$("encVideo");
     this.codec=document.querySelector('input[name=encCodec]:checked').value;
-    let w=parseInt($("encW").value,10)||160, h=parseInt($("encH").value,10)||120;
+    let w=parseInt($("encW").value,10)||360, h=parseInt($("encH").value,10)||360;
     w=Math.max(4,Math.min(1920,w)); h=Math.max(4,Math.min(1080,h));
     if (this.codec==="msv1"){ w&=~3; h&=~3; if(w<4)w=4; if(h<4)h=4; }
     this.outW=w; this.outH=h;
