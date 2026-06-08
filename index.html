@@ -189,6 +189,14 @@
         <label class="f">裁剪高
           <input id="encCh" placeholder="自动" inputmode="numeric" /></label>
       </div>
+      <div class="row" style="margin-top:6px;">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;flex:1;">
+          <input type="checkbox" id="encMsv1Skip" style="width:18px;height:18px;flex:0 0 auto;" />
+          <span>帧间 skip（P 帧，仅 MSV1·可运行时切换对比）</span>
+        </label>
+        <label class="f">skip 阈值 0-48（0=无损）
+          <input id="encMsv1Thr" value="0" inputmode="numeric" /></label>
+      </div>
       <div class="hint">裁剪先在源帧上取矩形，再缩放到输出分辨率。编码方式与所有参数在“开始编码”后锁定，需停止才能修改。</div>
     </div>
 
@@ -213,6 +221,7 @@
         <span>均帧 <b id="esAvg">0</b></span>
         <span>累计 <b id="esTotal">0</b></span>
         <span>码率 <b id="esRate">0</b></span>
+        <span>skip <b id="esSkip">—</b></span>
       </div>
       <div id="encMsg" class="hint"></div>
       <div class="hint">预览为“编码后再解码”的真实画面（MSV1 在浏览器内解码往返，JPEG 重解码显示）。停止后可下载 .avi，在 PC 用 VLC / ffmpeg 验证。</div>
@@ -235,6 +244,7 @@
         <span>发送 <b id="etFps">0</b> fps</span>
         <span>累计 <b id="etTotal">0</b></span>
         <span>码率 <b id="etRate">0</b></span>
+        <span>skip <b id="etSkip">—</b></span>
       </div>
       <div id="encTxMsg" class="hint"></div>
       <div class="hint">采集→编码一帧→按「文件」下发(type=RAW，纯编码字节)→发完再采下一帧，由 BLE 停等限速、不缓存累积。复用「BLE 调试」页的下发协议与连接，单文件下发流程不受影响。SoC 端按约定的输出分辨率（见上方“输出”）解码每帧。</div>
@@ -784,9 +794,29 @@ function rgb555(r,g,b){ return (((r>>3)&31)<<10)|(((g>>3)&31)<<5)|((b>>3)&31); }
 const MSV1_SCAN = [12,13,14,15,8,9,10,11,4,5,6,7,0,1,2,3];
 const isSkipColorMsv1 = w => ((w>>8)&0xfc)===0x84;
 
-function encodeMSV1Frame(rgba, W, H){
-  const bw=W>>2, bh=H>>2, words=[];
-  for (let by=bh-1; by>=0; by--) for (let bx=0; bx<bw; bx++) encMsv1Block(rgba,W,bx*4,by*4,words);
+// 帧间 skip：当前块每像素与上一帧(设备持有的解码值)的 RGB555 差之和 ≤ thr 则跳过(复用上一帧)。
+// thr=0 时仅完全相同(无损)才跳；thr>0 容忍轻微变化(更激进、可能拖影)。
+function blockSkippableMsv1(rgba, prev, W, x0, y0, thr){
+  for (let py=0;py<4;py++) for (let px=0;px<4;px++){
+    const i=((y0+py)*W+(x0+px))*4;
+    const d=Math.abs((rgba[i]>>3)-(prev[i]>>3))+Math.abs((rgba[i+1]>>3)-(prev[i+1]>>3))+Math.abs((rgba[i+2]>>3)-(prev[i+2]>>3));
+    if (d>thr) return false;
+  }
+  return true;
+}
+// skip-run 写出：byte_a 低字节、byte_b=0x84|高2位；单个 skip 块最多 1023(0x3ff) 块，超出拆多个。
+function flushSkipMsv1(words, n){ while(n>0){ const k=Math.min(n,0x3ff); words.push(((0x84|((k>>8)&3))<<8)|(k&0xff)); n-=k; } }
+
+let _msv1Skip=0;   // 上一次 encodeMSV1Frame 跳过的块数（统计/对比用）
+// prev 缺省=全 I 帧(逐块编码)；提供 prev(上一帧解码 rgba) 则产出 P 帧(skip 复用上一帧)。
+function encodeMSV1Frame(rgba, W, H, prev, thr){
+  const bw=W>>2, bh=H>>2, words=[]; let run=0; _msv1Skip=0; thr=thr||0;
+  for (let by=bh-1; by>=0; by--) for (let bx=0; bx<bw; bx++){
+    if (prev && blockSkippableMsv1(rgba, prev, W, bx*4, by*4, thr)){ run++; _msv1Skip++; continue; }
+    if (run){ flushSkipMsv1(words, run); run=0; }
+    encMsv1Block(rgba,W,bx*4,by*4,words);
+  }
+  if (run) flushSkipMsv1(words, run);
   words.push(0x0000);
   const out=new Uint8Array(words.length*2);
   for (let i=0;i<words.length;i++){ out[i*2]=words[i]&0xff; out[i*2+1]=(words[i]>>8)&0xff; }
@@ -820,8 +850,10 @@ function encMsv1Block(rgba,W,x0,y0,words){
   words.push(mask&0xffff, cA&0x7fff, cB&0x7fff);
 }
 
-function decodeMSV1Frame(buf, W, H){
-  const out=new Uint8ClampedArray(W*H*4); const bw=W>>2, bh=H>>2; let sp=0;
+// out 缺省=新建全 0(全 I/单帧)；传入持久缓冲则 P 帧的 skip 块原样保留上一帧像素(顺序解码语义)。
+function decodeMSV1Frame(buf, W, H, out){
+  if (!out) out=new Uint8ClampedArray(W*H*4);
+  const bw=W>>2, bh=H>>2; let sp=0;
   const rd=()=>{ const v=buf[sp]|(buf[sp+1]<<8); sp+=2; return v; };
   const put=(x,y,c)=>{ const r=(c>>10)&31,g=(c>>5)&31,b=c&31,i=(y*W+x)*4;
     out[i]=(r<<3)|(r>>2); out[i+1]=(g<<3)|(g>>2); out[i+2]=(b<<3)|(b>>2); out[i+3]=255; };
@@ -856,7 +888,7 @@ class AviW{ constructor(){ this.b=[]; }
   bytes(a){ for(let i=0;i<a.length;i++) this.b.push(a[i]&255); return this; }
   out(){ return Uint8Array.from(this.b); }
 }
-function buildAVI(frames, width, height, fps, fourcc, bitCount){
+function buildAVI(frames, width, height, fps, fourcc, bitCount, keyFlags){
   const n=frames.length; let maxF=1;
   const chunks=frames.map(f=>{ const pad=f.length&1; if(f.length>maxF) maxF=f.length; return {f,pad,total:8+f.length+pad}; });
   let cur=4; const idx=chunks.map(c=>{ const off=cur; cur+=c.total; return {off,size:c.f.length}; });
@@ -875,7 +907,7 @@ function buildAVI(frames, width, height, fps, fourcc, bitCount){
   w.str("LIST").u32(moviData).str("movi");
   for (const c of chunks){ w.str("00dc").u32(c.f.length).bytes(c.f); if(c.pad) w.b.push(0); }
   w.str("idx1").u32(idx1Data);
-  for (const e of idx) w.str("00dc").u32(0x10).u32(e.off).u32(e.size);
+  for (let i=0;i<idx.length;i++){ const e=idx[i]; w.str("00dc").u32(keyFlags?(keyFlags[i]?0x10:0):0x10).u32(e.off).u32(e.size); }   // 0x10=KEYFRAME；P 帧(skip)标 0
   return w.out();
 }
 
@@ -890,6 +922,7 @@ const enc = {
   work:null, wctx:null, pctx:null,
   mode:"record", nFrames:0, streamSeq:0,   // mode: "record"(本地录制+下载) | "stream"(实时 BLE 下发)
   sending:false, dbgSeq:0,                  // sending=单帧调试发送进行中；dbgSeq=调试帧序号
+  skipOn:false, skipThr:0, decBuf:null, frameKey:[],   // 帧间 skip(P 帧)：开关/阈值/持久解码缓冲(=设备画面)/每帧是否关键帧
 
   init(){
     this.work=document.createElement("canvas");
@@ -906,6 +939,8 @@ const enc = {
     $("encTxStart").onclick=()=>this.start("stream");
     $("encTxStop").onclick=()=>this.stop();
     $("encTxOne").onclick=()=>this.sendOne();
+    $("encMsv1Skip").onchange=()=>{ this.skipOn=$("encMsv1Skip").checked; this.decBuf=null; };   // 运行时切换：清基准→下一帧强制全 I
+    $("encMsv1Thr").onchange=()=>{ this.skipThr=Math.max(0,Math.min(48,parseInt($("encMsv1Thr").value,10)||0)); };
     this.refreshTx();
   },
 
@@ -1037,6 +1072,9 @@ const enc = {
     const pv=$("encPreview"); pv.width=w; pv.height=h;
     if (!this.previewOn) this.drawPreviewOff();
     this.frames=[]; this.totalBytes=0; this.fpsTimes=[]; this.nFrames=0; this.streamSeq=0; this.lastFps=0;
+    this.skipOn = this.codec==="msv1" && $("encMsv1Skip").checked;   // 帧间 skip 仅对 MSV1 生效
+    this.skipThr = Math.max(0,Math.min(48,parseInt($("encMsv1Thr").value,10)||0));
+    this.decBuf=null; this.frameKey=[];                              // 重置持久解码缓冲与关键帧标记
     this.running=true; this.lockCfg(true);
     $("encStart").disabled=true; $("encDownload").disabled=true;
     $("esCodec").textContent = this.codec==="msv1"?"MSV1":"JPEG";
@@ -1063,10 +1101,14 @@ const enc = {
     let frame=null;
     if (this.codec==="msv1"){
       const img=this.wctx.getImageData(0,0,this.outW,this.outH);
-      frame=encodeMSV1Frame(img.data, this.outW, this.outH);
-      if (this.previewOn){
-        const dec=decodeMSV1Frame(frame, this.outW, this.outH);
-        this.pctx.putImageData(new ImageData(dec, this.outW, this.outH), 0, 0);
+      const prev = (this.skipOn && this.decBuf) ? this.decBuf : null;   // 无 prev=全 I 帧；有 prev=P 帧(skip 复用上一帧)
+      frame=encodeMSV1Frame(img.data, this.outW, this.outH, prev, this.skipThr);
+      this.frameKey.push(!prev);                                        // 关键帧=本帧未参考上一帧
+      // 持久解码缓冲(=设备端实际画面)：skip 块原样保留上一帧。skip 需它作下一帧基准、预览需它显示；
+      // 两者都关时跳过解码以省电(此时必为全 I 帧，无需基准)。
+      if (this.skipOn || this.previewOn){
+        this.decBuf = decodeMSV1Frame(frame, this.outW, this.outH, this.decBuf || new Uint8ClampedArray(this.outW*this.outH*4));
+        if (this.previewOn) this.pctx.putImageData(new ImageData(this.decBuf.slice(), this.outW, this.outH), 0, 0);
       }
     } else {
       const blob=await new Promise(r=>this.work.toBlob(r,"image/jpeg",this.quality/100));
@@ -1118,6 +1160,7 @@ const enc = {
     $("esAvg").textContent=fmtBytes(Math.round(avg));
     $("esTotal").textContent=fmtBytes(this.totalBytes);
     $("esRate").textContent=fmtRate(avg*fps*8);
+    $("esSkip").textContent = (this.codec==="msv1"&&this.skipOn) ? `${_msv1Skip}/${(this.outW>>2)*(this.outH>>2)}` : "—";
   },
 
   updateTxStats(lastBytes){
@@ -1127,6 +1170,7 @@ const enc = {
     $("etFps").textContent=fps.toFixed(1);
     $("etTotal").textContent=fmtBytes(this.totalBytes);
     $("etRate").textContent=fmtRate(avg*fps*8);
+    $("etSkip").textContent = (this.codec==="msv1"&&this.skipOn) ? `${_msv1Skip}/${(this.outW>>2)*(this.outH>>2)}` : "—";
   },
 
   stop(){
@@ -1150,7 +1194,7 @@ const enc = {
   download(){
     if (!this.frames.length) return;
     const isMsv1=this.codec==="msv1";
-    const avi=buildAVI(this.frames, this.outW, this.outH, this.fps, isMsv1?"MSVC":"MJPG", isMsv1?16:24);
+    const avi=buildAVI(this.frames, this.outW, this.outH, this.fps, isMsv1?"MSVC":"MJPG", isMsv1?16:24, isMsv1?this.frameKey:null);
     const url=URL.createObjectURL(new Blob([avi], {type:"video/avi"}));
     const a=document.createElement("a");
     const ts=new Date().toISOString().replace(/[-:T]/g,"").slice(0,14);
