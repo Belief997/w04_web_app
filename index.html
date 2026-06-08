@@ -63,7 +63,7 @@
 <body>
 <div class="wrap">
   <h1>W04 · 调试工具</h1>
-  <div class="sub">蓝牙下发协议验证 · 摄像头 / 屏幕视频编码 (MSV1 / JPEG)。仅安卓 Chrome/Edge，需 HTTPS。</div>
+  <div class="sub">蓝牙下发协议验证 · 摄像头视频编码 (MSV1 / JPEG)。仅安卓 Chrome/Edge，需 HTTPS。</div>
 
   <div class="tabs">
     <button id="tabBle" class="active">蓝牙下发</button>
@@ -144,15 +144,9 @@
     <div id="encWarn" class="banner"></div>
 
     <div class="card">
-      <h2>采集源</h2>
+      <h2>摄像头</h2>
       <div class="row">
-        <label class="f">来源
-          <select id="encSource">
-            <option value="camera">摄像头</option>
-            <option value="screen">全屏 / 屏幕</option>
-          </select>
-        </label>
-        <label class="f">镜头（仅摄像头）
+        <label class="f">镜头
           <select id="encFacing">
             <option value="environment">后置</option>
             <option value="user">前置</option>
@@ -160,13 +154,13 @@
         </label>
         <label class="f">操作
           <div class="grid2">
-            <button id="encCamStart">启动采集</button>
+            <button id="encCamStart">启动摄像头</button>
             <button id="encCamStop" class="ghost" disabled>关闭</button>
           </div>
         </label>
       </div>
       <video id="encVideo" autoplay muted playsinline style="margin-top:10px;"></video>
-      <div id="encSrcInfo" class="hint">未启动。需 HTTPS 与用户授权（点击“启动采集”触发）。全屏走 getDisplayMedia，iOS 浏览器不支持。</div>
+      <div id="encSrcInfo" class="hint">未启动。getUserMedia 需 HTTPS 与用户授权（点击“启动摄像头”触发）。</div>
     </div>
 
     <div class="card" id="encCfgCard">
@@ -235,7 +229,7 @@
 
     <div class="card">
       <h2>实时发送到设备（边编码边下发 BLE）</h2>
-      <div id="encTxWarn" class="hint">①先到「BLE 调试」页连接设备　②再启动采集（摄像头 / 屏幕）</div>
+      <div id="encTxWarn" class="hint">①先到「BLE 调试」页连接设备　②再启动摄像头</div>
       <div class="grid2">
         <button id="encTxStart" disabled>开始实时发送</button>
         <button id="encTxStop" class="ghost" disabled>停止</button>
@@ -938,7 +932,6 @@ const enc = {
     $("tabEnc").onclick=()=>showTab("enc");
     $("encCamStart").onclick=()=>this.startCam();
     $("encCamStop").onclick=()=>this.stopCam();
-    $("encSource").onchange=()=>this.updateSrcUI();
     $("encStart").onclick=()=>this.start("record");
     $("encStop").onclick=()=>this.stop();
     $("encDownload").onclick=()=>this.download();
@@ -948,7 +941,6 @@ const enc = {
     $("encTxOne").onclick=()=>this.sendOne();
     $("encMsv1Skip").onchange=()=>{ this.skipOn=$("encMsv1Skip").checked; this.decBuf=null; };   // 运行时切换：清基准→下一帧强制全 I
     $("encMsv1Thr").onchange=()=>{ this.skipThr=Math.max(0,Math.min(48,parseInt($("encMsv1Thr").value,10)||0)); };
-    this.updateSrcUI();
     this.refreshTx();
   },
 
@@ -965,7 +957,7 @@ const enc = {
     if (this.running) w.textContent = this.mode==="stream" ? "实时发送中…" : "本地录制中（停止后可实时发送 / 单帧调试）";
     else if (this.sending) w.textContent="单帧发送中…";
     else if (!connected) w.textContent="① 先到「BLE 调试」页连接设备";
-    else if (!this.stream) w.textContent="② 再启动采集（摄像头 / 屏幕）";
+    else if (!this.stream) w.textContent="② 再启动摄像头";
     else w.textContent="就绪：可开始实时发送，或「调试 · 手动发送单帧」";
   },
 
@@ -1022,52 +1014,32 @@ const enc = {
     g.fillText("预览已关闭 · 节省资源", cv.width/2, cv.height/2);
   },
 
-  // 采集源 UI：屏幕模式禁用镜头选择；未采集时按来源刷新提示
-  updateSrcUI(){
-    const screen = $("encSource").value==="screen";
-    $("encFacing").disabled = screen;
-    if (!this.stream) $("encSrcInfo").textContent = screen
-      ? "全屏采集：点击「启动采集」后浏览器弹窗授权 (getDisplayMedia)。iOS 浏览器不支持；Android 需 Chrome 前台运行。"
-      : "摄像头采集：点击「启动采集」授权 (getUserMedia，需 HTTPS)。";
-  },
-
   async startCam(){
+    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)){ this.msg("此浏览器不支持 getUserMedia","err"); return; }
     this.stopCam();
-    const src=$("encSource").value;
     try{
-      if (src==="screen"){
-        if (!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia)){ this.msg("此浏览器不支持屏幕采集 (getDisplayMedia)。iOS 浏览器无此能力。","err"); return; }
-        this.stream=await navigator.mediaDevices.getDisplayMedia({ video:{ width:{ideal:1280}, height:{ideal:720} }, audio:false });
-      } else {
-        if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)){ this.msg("此浏览器不支持 getUserMedia","err"); return; }
-        const facing=$("encFacing").value;
-        this.stream=await navigator.mediaDevices.getUserMedia({ video:{ facingMode:facing, width:{ideal:1280}, height:{ideal:720} }, audio:false });
-      }
+      const facing=$("encFacing").value;
+      this.stream=await navigator.mediaDevices.getUserMedia({ video:{ facingMode:facing, width:{ideal:1280}, height:{ideal:720} }, audio:false });
       const v=$("encVideo"); v.srcObject=this.stream; await v.play().catch(()=>{});
       if (!v.videoWidth) await new Promise(res=>{ v.onloadedmetadata=()=>res(); });
-      // 用户从浏览器原生 UI 结束共享（屏幕采集常见）/ 设备移除 → track 结束，自动收尾
-      const vt=this.stream.getVideoTracks()[0];
-      if (vt) vt.onended=()=>{ this.msg("采集源已结束（用户停止共享或设备移除）","err"); this.stopCam(); };
-      if (src==="screen") $("encSrcInfo").textContent=`屏幕源 ${v.videoWidth}×${v.videoHeight} · getDisplayMedia`;
-      else { const facing=$("encFacing").value; $("encSrcInfo").textContent=`摄像头源 ${v.videoWidth}×${v.videoHeight} · 镜头=${facing==="environment"?"后置":"前置"}`; }
+      $("encSrcInfo").textContent=`源分辨率 ${v.videoWidth}×${v.videoHeight} · 镜头=${facing==="environment"?"后置":"前置"}`;
       $("encCamStart").disabled=true; $("encCamStop").disabled=false; $("encStart").disabled=false;
-      this.msg(src==="screen"?"屏幕采集已启动，可开始编码":"摄像头已启动，可开始编码","ok");
+      this.msg("摄像头已启动，可开始编码","ok");
       this.refreshTx();
-    }catch(e){ this.msg("启动采集失败: "+(e.message||e),"err"); }
+    }catch(e){ this.msg("启动摄像头失败: "+(e.message||e),"err"); }
   },
 
   stopCam(){
     if (this.running) this.stop();
-    if (this.stream){ this.stream.getTracks().forEach(t=>{ t.onended=null; t.stop(); }); this.stream=null; }
+    if (this.stream){ this.stream.getTracks().forEach(t=>t.stop()); this.stream=null; }
     $("encVideo").srcObject=null;
     $("encCamStart").disabled=false; $("encCamStop").disabled=true; $("encStart").disabled=true;
     this.refreshTx();
   },
 
   lockCfg(lock){
-    ["encW","encH","encFps","encQ","encCx","encCy","encCw","encCh","encFacing","encSource","encCamStart"].forEach(id=>$(id).disabled=lock);
+    ["encW","encH","encFps","encQ","encCx","encCy","encCw","encCh","encFacing","encCamStart"].forEach(id=>$(id).disabled=lock);
     document.querySelectorAll('input[name=encCodec]').forEach(r=>r.disabled=lock);
-    if (!lock && $("encSource").value==="screen") $("encFacing").disabled=true;   // 屏幕模式：镜头恒禁用
   },
 
   readCrop(v){
@@ -1243,18 +1215,13 @@ enc.init();
 
 // 视频编码支持性检测
 (function(){
-  const md=navigator.mediaDevices;
-  const hasCam=!!(md && md.getUserMedia), hasScr=!!(md && md.getDisplayMedia);
-  if (!hasCam && !hasScr){
+  if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)){
     const b=$("encWarn"); b.style.display="block";
-    b.innerHTML="⚠ 当前环境不支持视频采集 (getUserMedia / getDisplayMedia)。需 <b>HTTPS</b> 且浏览器支持。";
+    b.innerHTML="⚠ 当前环境不支持摄像头采集 (getUserMedia)。需 <b>HTTPS</b> 且浏览器支持。";
     $("encCamStart").disabled=true;
   } else if (!window.isSecureContext){
     const b=$("encWarn"); b.style.display="block";
-    b.innerHTML="⚠ 非安全上下文，视频采集需要 <b>HTTPS</b>（或 localhost）。";
-  } else if (!hasScr){
-    const b=$("encWarn"); b.style.display="block";
-    b.innerHTML="ℹ 此环境不支持「全屏 / 屏幕」采集 (getDisplayMedia)，仅可用摄像头（iOS 浏览器即属此类）。";
+    b.innerHTML="⚠ 非安全上下文，摄像头需要 <b>HTTPS</b>（或 localhost）。";
   }
 })();
 
