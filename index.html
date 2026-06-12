@@ -135,6 +135,25 @@
   </div>
 
   <div class="card">
+    <h2>WiFi 配网 (BLE 辅助)</h2>
+    <div class="row">
+      <label class="f">SSID（1-32 字节）
+        <input id="wifiSsid" value="roys" maxlength="32" />
+      </label>
+      <label class="f">密码（0-64 字节）
+        <input id="wifiPwd" type="password" value="1234567890" maxlength="64" />
+      </label>
+    </div>
+    <div class="row" style="margin-top:10px;align-items:center;">
+      <button id="wifiGo" disabled>开始配网</button>
+      <label class="pill" style="cursor:pointer;"><input id="wifiPwdShow" type="checkbox" style="width:auto" /> 显示密码</label>
+      <label class="pill" style="cursor:pointer;"><input id="wifiSave" type="checkbox" checked style="width:auto" /> 保存到设备</label>
+      <span id="wifiMsg" style="font-size:12px;color:var(--muted);flex:1 1 100%;">未连接设备（请先连接）</span>
+    </div>
+    <div class="hint">通过当前 BLE 连接下发 WiFi 凭据 (L2 cmd=0x0D)；设备连上 WiFi 后回传 IP:port。凭据经当前 BLE 连接发送，密码不写入日志。</div>
+  </div>
+
+  <div class="card">
     <h2>报文日志 <button id="btnClear" class="ghost" style="float:right;padding:3px 10px;font-size:11px;">清空</button></h2>
     <div id="log"></div>
   </div>
@@ -329,6 +348,25 @@ function buildDataFrame(blockSeq, chunk){
 function buildEndReq(crc){ return buildL2(K_END_REQ, new Uint8Array(u32be(crc>>>0))); }
 function buildAbort(reason){ return buildL2(K_ABORT, new Uint8Array([reason])); }
 
+// ── L2 WiFi 配网子命令 (cmd=0x0D，对照 desk-mate protocols/l2_wifi_provisioning.py) ──
+const CMD_WIFI=0x0D;
+const KW_CFG_SET=0x01, KW_CFG_ACK=0x02, KW_STAT_REQ=0x03, KW_STAT=0x04;
+const WIFI_FLAG_SAVE=0x01;
+const WIFI_ACK_ERR={0:"无错误",1:"Payload 格式错误",2:"不支持的配网模式",3:"无效的 SSID",4:"无效的密码",5:"设备繁忙"};
+const WIFI_STAT_ERR={0:"无错误",1:"WiFi 认证失败",2:"未找到该 WiFi",3:"DHCP 失败",4:"连接超时",5:"TCP 服务启动失败",6:"未知错误"};
+const WIFI_STATE={0:"idle",1:"connecting",2:"connected",3:"failed"};
+// 通用 L2 构造（指定 cmd）；buildL2 固定 CMD_FILE，配网走 CMD_WIFI
+function buildL2Cmd(cmd, key, value){
+  return new Uint8Array([cmd,0x00,key,(value.length>>8)&0xFF,value.length&0xFF, ...value]);
+}
+// WIFI_CONFIG_SET value: reqId(u16be) flags(u8) ssidLen(u8) ssid pwdLen(u8) pwd  (UTF-8)
+function buildWifiConfigSet(ssid, pwd, reqId, flags){
+  const e=new TextEncoder(), s=e.encode(ssid), p=e.encode(pwd);
+  const value=new Uint8Array([(reqId>>8)&0xFF, reqId&0xFF, flags&0xFF, s.length, ...s, p.length, ...p]);
+  return buildL2Cmd(CMD_WIFI, KW_CFG_SET, value);
+}
+function buildWifiStatusReq(reqId){ return buildL2Cmd(CMD_WIFI, KW_STAT_REQ, new Uint8Array([(reqId>>8)&0xFF, reqId&0xFF])); }
+
 // ───────────────────────── 日志 ─────────────────────────
 function log(cls, msg){
   const el = document.createElement("div");
@@ -379,6 +417,7 @@ function handleL1(pkt){
   const l2 = pkt.slice(8);
   if (!quiet) parseL2(l2);
   xfer.onL2(l2);
+  wifi.onL2(l2);
 }
 
 function parseL2(l2){
@@ -564,6 +603,7 @@ function toggleButtons(connected){
   $("btnConnParams").disabled = !connected;
   $("btnSendHex").disabled = !connected;
   xfer.refreshStart();
+  wifi.onConn(connected);
   if (typeof enc!=="undefined" && enc.refreshTx) enc.refreshTx();
 }
 
@@ -767,6 +807,116 @@ const xfer = {
   },
 };
 
+// ─────────── WiFi 配网状态机 (BLE 辅助，L2 cmd=0x0D，对照 desk-mate wifi_provisioning_widget) ───────────
+// 流程：CONFIG_SET → ACK → 设备连 WiFi → STATUS(connected, ip:port)。
+// 安全：CONFIG_SET 以 silent=true 下发，整帧 hex 不入日志，仅记录脱敏摘要。
+const wifi = {
+  S_IDLE:"idle", S_SENT:"sent", S_ACK:"ack", S_WAIT:"wait", S_DONE:"done", S_FAIL:"fail",
+  T_ACK:5000, T_STAT:30000, T_FINAL:10000,
+  state:"idle", reqId:0, connected:false, ackT:0, statT:0, reqSent:false,
+
+  msg(t, kind){
+    const e=$("wifiMsg"); if(!e) return;
+    e.textContent=t||"";
+    e.style.color = kind==="err" ? "var(--err)" : kind==="ok" ? "var(--ok)" : "var(--muted)";
+  },
+  _inputs(on){ ["wifiSsid","wifiPwd","wifiSave","wifiPwdShow"].forEach(id=>{ const e=$(id); if(e) e.disabled=!on; }); },
+
+  setState(s){
+    this.state=s;
+    const idle = (s===this.S_IDLE || s===this.S_FAIL || s===this.S_DONE);
+    this._inputs(idle && this.connected);
+    const btn=$("wifiGo"); if(!btn) return;
+    btn.disabled = !this.connected || !idle;
+    btn.textContent = (s===this.S_FAIL||s===this.S_DONE) ? "重新配网" : idle ? "开始配网" : "配网中…";
+  },
+
+  onConn(connected){
+    this.connected=connected;
+    clearTimeout(this.ackT); clearTimeout(this.statT);
+    this.setState(this.S_IDLE);
+    this.msg(connected ? "就绪：填写 SSID / 密码后点「开始配网」" : "未连接设备（请先连接）");
+  },
+
+  go(){
+    if (!txChar){ this.msg("未连接设备：请先连接","err"); return; }
+    if (xfer.state!==xfer.S_IDLE){ this.msg("BLE 正忙（文件下发进行中），请稍候","err"); return; }
+    const ssid=$("wifiSsid").value, pwd=$("wifiPwd").value, e=new TextEncoder();
+    const sl=e.encode(ssid).length, pl=e.encode(pwd).length;
+    if (sl<1 || sl>32){ this.msg(`SSID 编码后 ${sl} 字节，须在 1..32`,"err"); return; }
+    if (pl>64){ this.msg(`密码编码后 ${pl} 字节，超出 64`,"err"); return; }
+    const flags = $("wifiSave").checked ? WIFI_FLAG_SAVE : 0;
+    this.reqId=(this.reqId+1)&0xFFFF;
+    const payload=buildWifiConfigSet(ssid, pwd, this.reqId, flags), seq=nextSeq();
+    // silent=true 抑制 _writeFrame 的整帧 hex 日志；此处仅记录脱敏摘要（密码不入日志）
+    log("tx", `→ WIFI_CONFIG_SET seq=${seq} req=${this.reqId} ssid="${ssid}" pwd=${pl}B flags=0x${flags.toString(16)}`);
+    sendRaw(buildL1(payload, seq), true).catch(err=>this._fail("发送失败: "+(err.message||err)));
+    this.setState(this.S_SENT);
+    this.msg(`已发送配网请求到「${ssid}」，等待设备确认…`);
+    clearTimeout(this.ackT); this.ackT=setTimeout(()=>this._fail(`ACK 超时（${this.T_ACK/1000}s 未收到设备确认）`), this.T_ACK);
+  },
+
+  // 被动监听全部 L2 帧，仅处理 cmd=0x0D（与 xfer.onL2 并存，互不干扰）
+  onL2(l2){
+    if (l2.length<5 || l2[0]!==CMD_WIFI) return;
+    const key=l2[2], vlen=u16be(l2[3],l2[4]), v=l2.slice(5,5+vlen);
+    if (key===KW_CFG_ACK) this._onAck(v);
+    else if (key===KW_STAT) this._onStatus(v);
+  },
+
+  _onAck(v){
+    clearTimeout(this.ackT);
+    if (v.length<4){ this._fail("配网 ACK 格式错误"); return; }
+    const reqId=u16be(v[0],v[1]), result=v[2], err=v[3];
+    log("rx", `← WIFI_CONFIG_ACK req=${reqId} result=${result} err=${err}`);
+    if (reqId!==this.reqId){ log("warn",`忽略过期 ACK req=${reqId}（当前 ${this.reqId}）`); return; }
+    if (this.state!==this.S_SENT) return;
+    if (result!==0x00){ this._fail("设备拒绝配网："+(WIFI_ACK_ERR[err]??`错误码 ${err}`)); return; }
+    this.setState(this.S_ACK);
+    this.reqSent=false;
+    this.msg("设备已接受，正在连接 WiFi…");
+    clearTimeout(this.statT); this.statT=setTimeout(()=>this._statTimeout(), this.T_STAT);
+  },
+
+  _onStatus(v){
+    if (v.length<5){ log("warn","WIFI_STATUS 格式错误"); return; }
+    const reqId=u16be(v[0],v[1]), st=v[2], err=v[3], ipLen=v[4];
+    if (5+ipLen+2>v.length){ log("warn","WIFI_STATUS IP 段越界"); return; }
+    let ip=""; for(let i=0;i<ipLen;i++) ip+=String.fromCharCode(v[5+i]);
+    const port=u16be(v[5+ipLen], v[6+ipLen]);
+    log("rx", `← WIFI_STATUS req=${reqId} state=${WIFI_STATE[st]??st} err=${err}${ip?` ip=${ip}:${port}`:""}`);
+    if (st===0x01){ if(this.state===this.S_ACK||this.state===this.S_WAIT){ this.setState(this.S_WAIT); this.msg("设备正在连接 WiFi…"); } return; }
+    if (st===0x02){ clearTimeout(this.statT); this.setState(this.S_DONE); this.msg(`配网成功！设备 ${ip}:${port}`,"ok"); log("ack",`✅ WiFi 配网成功，设备 ${ip}:${port}`); return; }
+    if (st===0x03){ clearTimeout(this.statT); this._fail("配网失败："+(WIFI_STAT_ERR[err]??`错误码 ${err}`)); return; }
+  },
+
+  _statTimeout(){
+    if (!this.reqSent){
+      this.reqSent=true;
+      log("info","配网状态超时，主动查询设备状态…");
+      sendL2(buildWifiStatusReq(this.reqId)).catch(()=>{});
+      clearTimeout(this.statT); this.statT=setTimeout(()=>this._fail("配网状态超时（设备未上报结果）"), this.T_FINAL);
+    } else {
+      this._fail("配网状态超时（设备未上报结果）");
+    }
+  },
+
+  _fail(reason){
+    clearTimeout(this.ackT); clearTimeout(this.statT);
+    this.setState(this.S_FAIL);
+    this.msg(reason,"err");
+    log("err",`[配网] ${reason}`);
+  },
+
+  init(){
+    const go=$("wifiGo"); if(!go) return;
+    go.onclick=()=>this.go();
+    const pw=$("wifiPwd"), tg=$("wifiPwdShow");
+    if (tg && pw) tg.onchange=()=>{ pw.type = tg.checked ? "text" : "password"; };
+    this.onConn(false);
+  },
+};
+
 // ───────────────────────── 事件绑定 ─────────────────────────
 $("btnConnect").onclick = connect;
 $("btnDisconnect").onclick = disconnect;
@@ -783,6 +933,7 @@ $("btnW4").onclick = () => xfer.loadSample("./tests/wallpaper_4.bin");
 $("btnW5").onclick = () => xfer.loadSample("./tests/wallpaper_5.bin");
 $("btnStart").onclick = () => xfer.start();
 $("btnCancel").onclick = () => xfer.abort(0x00);
+wifi.init();
 
 // ════════════════════════ Tab 2 · 视频编码 (MSV1 / JPEG) ════════════════════════
 // MSV1 编码器/解码器 + AVI 封装：移植自 _msv1_probe，已用 ffmpeg 逐字节校验。
